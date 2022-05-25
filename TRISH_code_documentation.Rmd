@@ -1,0 +1,2683 @@
+---
+title: "Dynamic Ensemble Prediction of Cognitive Performance in Spaceflight"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+subtitle: "Code Documentation"
+author: "Danni Tu"
+date: "`r format(Sys.Date(), format='%B %d, %Y')`"
+bibliography: trish.bib
+output: 
+  html_document:
+    number_sections: true
+    theme: lumen
+    toc: true
+---
+
+# Project Overview
+
+We provide code documentation used in the paper, "Dynamic Ensemble Prediction of Cognitive Performance in Spaceflight." The goal of this project was to predict neurocognitive performance assessed via a brief psychomotor vigilance test (PVT) in astronauts aboard the International Space Station. In particular, the outcome of interest was the LRM-50 metric [@Basner2015], where values of LRM-50 less than 0 correspond to better performance and lower likelihood of being sleep-deprived, and vice versa for LRM-50 greater than 0. Our data consisted of longitudinal observations of astronaut PVT performance, as well as other time-varying predictors measured by the Reaction Self-Test (RST) and PVT, operational variables, environmental stressors, and demographic traits.
+
+To predict LRM-50, we employed an *ensemble model* where the final predicted outcome was the average of predicted outcomes from the following models:
+
+- Random Forest [@Breiman2001]
+- Linear Mixed Effects with AR1 Autocorrelation [@Box2016]
+- Functional Concurrent Regression [@Leroux2017]
+
+The ensemble was ultimately selected as it minimized prediction error better than any single model alone.
+
+*Note:* some directory and Excel column naming conventions may vary based on your operating system. The following code was run on a Mac OS.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", eval = FALSE,
+                      message = FALSE, warning = FALSE, error = TRUE,
+                      fig.height = 7, fig.width = 10, results = 'asis')
+
+options(scipen=999)
+
+trish_path <- "/Users/dtu/Library/CloudStorage/Box-Box/TRISH_Analysis/"
+
+# Location of the data
+dir.path <- file.path(trish_path, 'Shiny_TRISH/Data/' )
+# Location of the model objects
+mod.path.final <- file.path(dir.path, "Model_Predictions/Hourly_Final")
+# Location of the code
+code.path <- file.path(trish_path, "Shiny_TRISH/TRISH/Exploration/")
+```
+
+```{r packages_paths, eval = TRUE}
+# Markdown and Plots 
+library(pander)
+library(plotly)
+library(d3heatmap)
+library(stargazer)
+library(pls)
+library(ggfortify)
+library(grid)
+library(gridExtra)
+# Modelling
+library(nlme)
+library(refund)
+library(fcr)
+library(randomForest)
+# Data
+library(fasttime)
+library(openxlsx)
+library(zoo)
+library(xts)
+library(lubridate)
+library(readxl)
+library(purrr)
+library(tidyverse)
+
+####### USER DEFINED PATHS ########
+# trish.path: folder containing everything, including the following subdirectories:
+# dir.path: subfolder of trish.path containing Data
+# mod.path.final: subfolder of trish.path containing model predictions/objects
+# code.path: subfolder of trish.path containing R scripts, e.g. helpers.R
+
+# Additionally, create folders in dir.path to hold the output
+# Directory to save all LOESS/interpolation objects
+smooth.path <- file.path(dir.path, "Smoothed Objects")
+if (!dir.exists(smooth.path)) dir.create(smooth.path)
+
+# Directory for final deliverable of data and data dictionary
+del.path <- file.path(dir.path, "Final Data Deliverable")
+if (!dir.exists(del.path)) dir.create(del.path)
+
+# Directory for variable selection
+sel.path <- file.path(dir.path, "Variable_Selection")
+if (!dir.exists(sel.path)) dir.create(sel.path)
+
+# Directory for prediction assessment
+day1.path <- file.path(dir.path, "Prediction_1Day")
+if (!dir.exists(day1.path)) dir.create(day1.path)
+
+# Number of cores for parallel processing
+n_cores = 8
+
+# Some helper functions (see Appendix below)
+source(file.path(code.path, "helpers.R"))
+
+# Read in variable names and their labels
+vars_and_labels <- read.csv(file.path(dir.path, "vars_and_labels.csv"))
+```
+
+## Data Availability
+
+Per funding agency requirements, the RST data analyzed in this study were uploaded to NASA's Life Sciences Data Archive (LSDA; [https://lsda.jsc.nasa.gov](https://lsda.jsc.nasa.gov)) and, together with the environmental data, are available upon request from NASA. 
+
+# Data Processing
+
+Data from multiple sources (RST data, environmental variable time series, demographic and other information) were cleaned, aggregated, and smoothed in preparation for statistical modelling.
+
+## RST File Cleaning
+
+First, we read in the raw RST data from the **.xlsx** file, which contains 1 row for each participant and instance of a Reaction Self-Test (RST). We then create new variables (variable names appearing like `this`) that we will need later in the analysis:
+
+1. **Medication Flags** for sleep aids, antihistamines, pain, and decongestants:
+    - `Med_SleepAid`, `Med_Pain`, `Med_Antihist`, and `Med_Decongest`
+
+2. **Date Variables** to track days since the beginning of the flight:
+    - `abs_days`: elapsed days since the first measurement in the entire data
+    - `abs_days_sub`: (person-level) elapsed days since the first pre-flight measurement
+
+3. **Average pre-flight PVT** (person-level) average overall performance score (OPS) score on the PVT in the pre-flight period: `Pre_PVT`
+
+4. **EVA** indicator variables if the participant has an EVA that day or the next day:
+    - `EVA_Today` and `EVA_Tomorrow`
+5. **Standardized Cognitive Outcomes**: for each participant, the PVT and LRM-50 metrics were transformed into $z$-scores using the person-specific mean and variance:
+    - `LRM_Z` is the standardized LRM-50
+    - `PVT_Z` is the standardized PVT
+6. **Computer Location**: for each RST instance, we match the computer location to either Node 2 or US Lab: `Location`
+
+
+```{r data1}
+# Pre-defined names: sleep aids, painkillers, antihistamines, decongestants
+meds_sleep = c("Ambien", "Sonata")
+meds_pain = c("Ibuprofen", "Tylenol", "Aspirin", "Naproxen")
+meds_antihist = c("Claritin", "Benadryl")
+meds_dec = c("Sudafed")
+
+# EVA Variables - EVA Tomorrow
+eva_tom <- read_excel(paste(dir.path,'RST_Data.xlsx',sep='/'),
+                      sheet = 5, col_types = c("text", "date", "date", "text", "numeric", "numeric")) %>%
+  select(ID, EVA_Tomorrow_Date, EVA_Tomorrow, Time_of_Day) %>%
+  filter(EVA_Tomorrow == 1)
+# EVA Variables - EVA Today
+eva_tod <- read_excel(paste(dir.path,'RST_Data.xlsx',sep='/'),
+                      sheet = 5, col_types = c("text", "date", "date", "text", "numeric", "numeric")) %>%
+  select(ID, EVA_Today_Date, EVA_Today, Time_of_Day) %>%
+  filter(EVA_Today == 1)
+
+# Extract column names from Excel file
+rst_raw_names <- read_excel(paste(dir.path,'RST_Data.xlsx',sep='/'),
+                            sheet = 2) %>% slice(2) %>% unlist %>% unname
+# Read in the data
+rst <- read_excel(paste(dir.path,'RST_Data.xlsx',sep='/'),
+                  sheet = 2, skip = 2,
+                  col_types = c(rep("text", 3),
+                                "date",
+                                rep("text", 136)))
+
+# Format column names so spaces become underscores
+rst.clean <- rst %>%
+  `colnames<-`(gsub('([[:punct:]])|\\s+','_',rst_raw_names)) 
+
+# Remove columns named "Empty"
+remove_cols = which(rst_raw_names=='Empty')
+
+rst.clean <- rst.clean[,-remove_cols] %>%
+  # Rename the neurobehavioral variables
+  rename(Errors_of_comission = Erros_of_comission,
+         Difficulty_Rating = Difficulty_Rating__0_Not__1_Somewhat__2_Very____no_data_,
+         Interrupted = Interrupted_by_crewmember_ground_control,
+         Problems_testing_equipment = Problems_with_the_testing_equipment,
+         # Rename the sleep questionnaire variables
+         Low_Workload = Workload__Very_high_0_vs_Very_low_10,
+         Poor_Sleep_Quality = Sleep_Quality__Good_0_vs_Poor_10,
+         Pre_PVT_Very_Sleepy = Pre_PVT___Not_at_all_0_vs_Very_much_10, 
+         Post_PVT_Very_Sleepy = Post_PVT___Not_at_all_0_vs_Very_much_10, 
+         Physically_Exhausted = Energetic_0_vs_Physically_exhausted_10, 
+         Mentally_Fatigued = Mentally_sharp_0_vs_Mentally_fatigued_10, 
+         Fresh_Ready_to_Go = Tired_0_vs_Fresh__ready_to_go_10, 
+         Very_stressed = Not_stressed_at_all_0_vs_Very_stressed_10) %>%
+  # Convert test completion time into POSIXct
+  mutate(Time_of_Test_Completion2 = format(
+    as.POSIXct(Sys.Date() + as.numeric(Time_of_Test_Completion)), 
+    "%H:%M", tz="UTC"),
+    # Combine the date and time of day into one variable: obs_time
+    obs_time = paste(Date_of_Test_Completion, Time_of_Test_Completion2),
+    obs_time = as.POSIXct(obs_time, tz = "UTC"),
+    # Truncated day/hour
+    Time_day = as.POSIXct(trunc(obs_time, units = "days"), tz = "UTC"),
+    Time_hour = as.POSIXct(trunc(obs_time, units = "hours"), tz = "UTC"),
+    # Total sleep time
+    Total_sleep_hrs = as.numeric(Total_sleep_time)*24,
+    # Other sleep variables (turn them to hours)
+    Time_fall_asleep = as.numeric(Time_it_took_to_fall_asleep)*24,
+    Time_awake_disturb = as.numeric(Total_time_awake_during_the_night_due_to_sleep_disturbances)*24,
+    Time_before_waking = as.numeric(Time_spent_in_bed_before_getting_up)*24,
+    Total_sleep_missed = Time_fall_asleep + Time_awake_disturb + Time_before_waking,
+    # Pre- and post-flight indicators
+    Pre = !is.na(Pre_Flight),
+    Post = !is.na(Post_Flight),
+    Time_Type = ifelse(Pre, "Pre", ifelse(Post, "Post", "Flight")),
+    Overall_Performance = as.numeric(Overall_Performance),
+    # Calculate days elapsed since first measurement for any participant
+    Earliest_hr = min(obs_time),
+    abs_days = as.numeric(difftime(time1 = obs_time, 
+                                                  time2 = Earliest_hr, units = "days")),
+    # Medication flags
+    Med_SleepAid = ifelse((Med1_Name %in% meds_sleep)|(Med2_Name %in% meds_sleep)|
+                            (Med3_Name %in% meds_sleep)|(Med4_Name %in% meds_sleep)|
+                            (Evening_Med1_Name %in% meds_sleep)|(Evening_Med2_Name %in% meds_sleep)|
+                            (Evening_Med3_Name %in% meds_sleep)|(Evening_Med4_Name %in% meds_sleep), 1, 0),
+    Med_Pain = ifelse((Med1_Name %in% meds_pain)|(Med2_Name %in% meds_pain)|
+                        (Med3_Name %in% meds_pain)|(Med4_Name %in% meds_pain)|
+                        (Evening_Med1_Name %in% meds_pain)|(Evening_Med2_Name %in% meds_pain)|
+                        (Evening_Med3_Name %in% meds_pain)|(Evening_Med4_Name %in% meds_pain), 1, 0),
+    Med_Antihist = ifelse((Med1_Name %in% meds_antihist)|(Med2_Name %in% meds_antihist)|
+                            (Med3_Name %in% meds_antihist)|(Med4_Name %in% meds_antihist)|
+                            (Evening_Med1_Name %in% meds_antihist)|(Evening_Med2_Name %in% meds_antihist)|
+                            (Evening_Med3_Name %in% meds_antihist)|(Evening_Med4_Name %in% meds_antihist), 1, 0),
+    Med_Decongest = ifelse((Med1_Name %in% meds_dec)|(Med2_Name %in% meds_dec)|
+                             (Med3_Name %in% meds_dec)|(Med4_Name %in% meds_dec)|
+                             (Evening_Med1_Name %in% meds_dec)|(Evening_Med2_Name %in% meds_dec)|
+                             (Evening_Med3_Name %in% meds_dec)|(Evening_Med4_Name %in% meds_dec), 1, 0),
+    # Computer Locations
+    SSC_str = str_locate(string = Computer_Description, pattern = "SSC")[,1],
+    SSC = substr(Computer_Description, start = SSC_str, stop = SSC_str + 5),
+    SSC = gsub(pattern = ")| |SSC", replacement = "", x = SSC),
+    Location = ifelse(SSC %in% c(20, 14, 21, 19, 13, 6), "Node 2",
+                      ifelse(SSC %in% c(5, 8, 12, 4, 16), "US Lab",
+                             "Avg")),
+    # For noise interpolation
+    # Morning = 7am until 11pm (16 hours)
+    # Evening = 11pm - 7am (8 hours)
+    Noise_Day = ((hour(obs_time) >= 7) & (hour(obs_time) < 23)),
+    # LRM-50 Metric
+    LRM_50 = as.numeric(LRM_50)) %>%
+  # Ensure variables are numeric
+  mutate_at(vars(Errors_of_comission,Errors_of_omission, MeanRRT, Caffeine), as.numeric) %>%
+  # Deal with missing values in the sleep variables by just carrying the non-NA results forward
+  mutate_at(vars(Low_Workload:Very_stressed), as.numeric) %>%
+  mutate_at(vars(Low_Workload:Total_sleep_hrs, Total_sleep_missed), na.locf, na.rm = FALSE) %>%
+  # For each participant....
+  group_by(Subject_ID) %>%
+  # Calculate person-level observation ID
+  # Calculate person-level pre-flight PVT
+  # Calculate PVT_Z as the person-specific Z score
+  mutate(obs = 1:n(),
+         min_day_sub = min(abs_days),
+         abs_days_sub = abs_days - min(abs_days),
+         Pre_PVT = mean(Overall_Performance[Time_Type == "Pre"]),
+         PVT_Z = (Overall_Performance - mean(Overall_Performance))/sd(Overall_Performance),
+         LRM_Z = (LRM_50 - mean(LRM_50))/sd(LRM_50),
+         LRM_mean = mean(LRM_50),
+         LRM_sd = sd(LRM_50),
+         # Subject's 10th and 90th percentile of LRM
+         LRM_10bestworst = ifelse(LRM_50 < quantile(LRM_50, 0.10), "Best (Lowest) 10% LRM", ""),
+         LRM_10bestworst = ifelse(LRM_50 > quantile(LRM_50, 0.90), "Worst (Highest) 10% LRM", LRM_10bestworst)) %>% 
+  ungroup %>%
+  # Add EVA_Today and EVA_Tomorrow indicator variables
+  left_join(eva_tom, by = c('Date_of_Test_Completion' = 'EVA_Tomorrow_Date',
+                            'Subject_ID' = 'ID',
+                            'Test_Track_Type' = 'Time_of_Day')) %>%
+  left_join(eva_tod, by = c('Date_of_Test_Completion' = 'EVA_Today_Date',
+                            'Subject_ID' = 'ID',
+                            'Test_Track_Type' = 'Time_of_Day')) %>%
+  mutate(EVA_Today = ifelse(is.na(EVA_Today), 0, EVA_Today),
+         EVA_Tomorrow = ifelse(is.na(EVA_Tomorrow), 0, EVA_Tomorrow)) %>%
+  # Remove variables that were all missing in the data file
+  select(-Sleep_Shift_Proximity, -Machine_Type, -Adjusted_Hardware_Latency)
+```
+
+## Stress/Fatigue Composite Score
+
+To create a single variable `Self_PC_1` aggregating the various VAS self-report measures, we performed a principal components analysis of the following VAS response items:
+
+- Low Workload
+- Poor Sleep Quality (Morning Tests)/Very Sleepy (Evening Tests)
+- Physically Exhausted
+- Mentally Fatigued
+- Fresh and Ready to Go
+- Very Stressed
+
+```{r data2}
+# Self-Report Variables
+rst_self =  rst.clean %>%
+  select(Low_Workload,
+         Poor_Sleep_Quality,
+         Pre_PVT_Very_Sleepy,
+         Physically_Exhausted,
+         Mentally_Fatigued,
+         Fresh_Ready_to_Go,
+         Very_stressed) %>%
+  mutate_all(as.numeric) %>%
+  as.data.frame
+
+# PCA
+rst.pca_self <- prcomp(formula = ~., data = rst_self,
+                       na.action = "na.omit", scale = TRUE)
+
+# Get matrix of weights into correct shape
+weights_self = rst.pca_self$rotation[,1] %>% as.matrix
+
+# Get matrix of centers and scales into correct shape
+cen = rst.pca_self$center %>% as.matrix %>% t
+cen = cen[rep(1, times = nrow(rst_self)),]
+
+sca = rst.pca_self$scale %>% as.matrix %>% t
+sca = sca[rep(1, times = nrow(rst_self)),]
+
+# Weight the scaled data to produce weighted variable
+rst_scaled = ((data.matrix(rst_self) - cen)/sca)
+rst_scaled[is.na(rst_scaled)] <- 0
+
+# Multiply the scaled data by the loadings 
+vars_self = (rst_scaled %*% weights_self) %>%
+  as.data.frame %>%
+  `colnames<-`(paste0("Self_PC_", 1))
+
+rst.clean <- rst.clean %>%
+  cbind(vars_self)
+
+# Save the cleaned data into Final Data Deliverable folder
+saveRDS(rst.clean,
+        file = file.path(dir.path, "rst_clean.rds"))
+```
+
+The `Self_PC_1` variable was formed by weighting the 6 variables based on the Principal Component 1 loadings. In general, a higher value of `Self_PC_1` corresponds to feelings of worse sleep quality, more exhaustion and mental fatigue, more stress, higher workloads, and less freshness. Therefore, we named this variable the Stress/Fatigue Composite Score.
+
+## Predicted Lapses
+
+To calculate the predicted lapses, the Windows batch program mcc13_v4 [@McCauley2013; @dongen] was run using the observed sleep schedule (where the wake and bedtimes were carried forward if there was any missing data.) One participant did complete their sleep diary for any observation, so we imputed the mean number of predicted lapses for that person.
+
+```{r}
+# After running mcc13_v4, read in the predicted data
+dat_preds <- list.files(file.path(dir.path, "Circadian_Subject"),
+           pattern = "pred_", full.names = TRUE) %>%
+  map(preds_files_fun) %>%
+  Reduce(rbind,.)
+
+# Process and save everything
+saveRDS(dat_preds,
+        file.path(dir.path, "circadian_preds_raw.RDS"))
+
+# For inflight RSTs...
+rst.clean %>%
+  filter(Time_Type == "Flight") %>%
+  # Get the bedtime and sleep duration
+  select(Subject_ID, Time = obs_time, Day = Time_day,
+         Bedtime0 = Time_went_to_bed, 
+         Duration_FallAsleep = Time_it_took_to_fall_asleep, 
+         Total_sleep_hrs) %>%
+  # Format everything as integers for later
+  mutate(Bedtime_Minutes = as.numeric(Bedtime0)*24*60,
+         FallAsleep_Minutes = as.numeric(Duration_FallAsleep)*24*60,
+         Sleep_Minutes = as.integer(round(Total_sleep_hrs*60))) %>%
+  # For each participant, calculate the first and last days
+  group_by(Subject_ID) %>%
+  mutate(Day_First = min(Day),
+         Day_Last = max(Day)) %>%
+  ungroup %>%
+  # Only keep information from days when both bedtime & waketime are available
+  filter(!(is.na(Bedtime_Minutes)|is.na(FallAsleep_Minutes|is.na(Sleep_Minutes)))) %>%
+  mutate(Subject_ID = factor(Subject_ID)) %>%
+  split(.,.$Subject_ID) %>%
+  saveRDS(file.path(dir.path, "Circadian_Subject", "rst_sleep_raw.RDS"))
+
+dat_sleep <- readRDS(file.path(dir.path, "Circadian_Subject", "rst_sleep_raw.RDS")) %>%
+  Reduce(rbind,.)
+
+# Add the date back for each participant's data
+unique(dat_sleep$Subject_ID) %>%
+  map(merge_circadian,
+      preds_dat = dat_preds) %>%
+  Reduce(rbind,.) %>%
+  # Hourly predicted lapses file
+  saveRDS(., file = file.path(dir.path, "circadian_preds_hour.RDS"))
+
+# Daily predicted lapses file
+readRDS(file.path(dir.path, "circadian_preds_hour.RDS")) %>%
+  mutate(Day = as.POSIXct(trunc(Date_Time, units = "days"))) %>%
+  # Take the daily average
+  group_by(ID, Day) %>%
+  summarize(Pred_Avg_Lapses = mean(Pred_Avg_Lapses)) %>% 
+  ungroup %>%
+  saveRDS(., file = file.path(dir.path, "circadian_preds_daily.RDS"))
+```
+
+
+## Integrating RST and Environmental Data
+
+Integrating the many data sources into a single, "analytic" data frame for modelling required several strategies. One reason is that environmental variables were collected at different time intervals: Radiation was measured daily; Noise was measured hourly; and Temperature, CO2, and O2 were measured every few minutes. Moreover, these measurements came from different sensors distributed across the ISS. To match each RST data point to a single value of the environmental variable, we employed three tactics:
+
+- Spatial aggregation: if the participant took the RST on a computer in Node 2 or US Lab, then the measurement from Node 2 or US Lab was used, if available. Otherwise, a weighted average of the Node 2 and US Lab measurements was used.
+- Temporal aggregation: if the environmental data for that hour is available, then the hourly average of the environmental data was used.
+- Temporal smoothing: if the hourly average was unavailable, the environmental variables were smoothed using either local [LOESS smoothing](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/loess.html), the last observation carried forward (LOCF), or linear interpolation. The smoothed value was only imputed at the times when the hourly average was missing.
+
+Further details on how each variable was handled are given below:
+
+1. **Demographic data**: age (`Age_at_Dock`) and male indicator (`Male`)
+1. **Radiation** (`Radiation_Dose`) in units of mGy: this is in daily units, so it is smoothed using LOESS.
+2. **ISS Occupancy** (`ISS_Occupants`) or number of people aboard the ISS: this is also in daily units.
+3. **Noise**  (`Noise_dBA`) in dBA: noise levels were recorded only on a handful of days, so day (7am-11pm) and night (11pm-7am) measurements were separately linearly interpolated.
+4. **Temperature**  (`Temp`) in degrees Celsius: use LOESS-smoothed Node 2/US Lab measurement if the RST was taken on a computer in Node 2/US Lab. Otherwise, use the LOESS-smoothed weighted average of the Node 2 (75%) and US Lab (25%) measurements.
+5. **CO2**  (`CO2`) in mmHg. The following sensors were used depending on the calendar date (mm/dd/yyyy):
+- US Lab between 2/17/2001-9/7/2010
+- Node 3 between 9/8/2010-5/12/2011
+- Columbus Module between 5/13/2011-1/28/2012
+- Node 3 after 1/29/2012
+6. **O2**  (`ppO2`) in mmHg. The following sensors were used depending on the calendar date:
+- US Lab  between 2/17/2001-9/7/2010
+- Node 3 between 9/8/2010-5/12/2011
+- The mean of Node 3 and US Lab between 5/13/2011-1/28/2012
+- Node 3 after 1/29/2012
+6. **Predicted Lapses** (`Pred_Lapses`): this was calculated in the previous section.
+
+Because environmental data from the ISS was the only environmental data available (i.e., there was no environmental data collected for pre- or post-flight periods), the remainder of analyses only involve the inflight data.
+
+```{r data3, eval = FALSE}
+rst.clean <- readRDS(paste0(dir.path, "rst_clean.rds"))
+all_subject_ids = unique(rst.clean$Subject_ID)
+
+# Read in data to be merged with the cleaned RST data, rst.clean
+# Demographic 
+dem <- readRDS(paste0(dir.path, "demographic_vars.rds"))
+# Noise - hourly
+dat_noise_hr <- readRDS(paste0(dir.path, "noise_hr_loc.rds"))
+# Radiation - daily
+dat_rad_hr <- readRDS(paste0(dir.path, "rad_day.rds"))
+# Temperature - hourly average
+dat_temp_hr <- readRDS(paste0(dir.path, "temp_hr_loc.rds"))
+# O2 - hourly average
+dat_ppo2_hr <- readRDS(paste0(dir.path, "ppo2_hr.rds"))
+# CO2  - hourly average
+dat_co2_hr <- readRDS(paste0(dir.path, "co2_hourly.rds")) %>%
+  # Delete consecutive values that are repeated more than 3 times--
+  # these are likely due to sensor malfunction
+  mutate(CO2 = delete_reps(CO2))
+# Circadian - hourly
+# NOTE: program to predict lapses (mcc13_v4) is a Windows batch file, not shown here
+dat_circ_hr <- readRDS(file.path(dir.path, "circadian_preds_hour.RDS")) %>%
+  mutate(Date_Time = fastPOSIXct(trunc(Date_Time, units = "hours"), tz = "UTC"))
+
+dat_occ <- read_csv(paste0(dir.path, "iss_occupants.csv"), n_max = 1688) %>%
+  mutate(Time_day = as.POSIXct(Date, format = "%m/%d/%Y", tz = "UTC")) %>%
+  select(Time_day, ISS_Occupants = Occupants)
+
+# Add demographic variables to both flight and non-flight data
+rst_flight <- rst.clean %>%
+  mutate(Subject_ID = as.character(Subject_ID)) %>%
+  filter(Time_Type == "Flight") %>%
+  # Add demographic variables
+  left_join(., dem, by = c("Subject_ID" = "ID")) 
+
+rst_nonflight <- rst.clean %>%
+  mutate(Subject_ID = as.character(Subject_ID)) %>%
+  filter(Time_Type != "Flight") %>%
+  # Add demographic variables
+  left_join(., dem, by = c("Subject_ID" = "ID")) 
+
+rst.merged <- rst_flight %>%
+  # Merge environmental variables with in-flight only
+  left_join(., dat_noise_hr, by = c("Time_hour", "Location" = "Loc")) %>%
+  left_join(., dat_rad_hr, by = "Time_day") %>%
+  left_join(dat_temp_hr, by = c("Time_hour", "Location" = "Loc")) %>%
+  left_join(., dat_co2_hr, by = "Time_hour") %>%
+  left_join(., dat_ppo2_hr, by = "Time_hour") %>%
+  left_join(., dat_occ, by = "Time_day") %>%
+  # Circadian lapses
+  left_join(., dat_circ_hr, by = c("Time_hour" = "Date_Time",
+                                   "Subject_ID" = "ID")) %>%
+  # Merge back with the full data
+  bind_rows(rst_nonflight) %>%
+  arrange(Subject_ID, abs_days_sub)
+
+# Save this file
+saveRDS(rst.merged,
+        file = paste0(dir.path, "rst_full_hr.rds"))
+```
+
+### Smoothing Environmental Variables
+
+These data were processed from their raw formats using the script given in the Appendix. Temperature, radiation, CO2, and O2 were smoothed using LOESS. Noise was smoothed using linear interpolation, separately for daytime (7 AM to 11PM) or nighttime (11PM to 6AM). Sleep diary data (for predicted lapses) was smoothed using LOCF.
+
+```{r loess_env, eval = FALSE}
+# Temperature - fit separate LOESS for Node 2/US Lab/Averaged values
+temp_hr <- readRDS(file.path(dir.path, "temp_hr_loc.RDS")) %>%
+  mutate(Time_hour2 = as.numeric(Time_hour)) %>% # LOESS only works on numeric domains
+  split(., .$Loc)
+
+loess(Temp ~ Time_hour2, data = temp_hr$Avg, span = 0.1,
+      control = loess.control("direct")) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_temp_avg_hr.RDS"))
+
+loess(Temp ~ Time_hour2, data = temp_hr$`Node 2`, span = 0.1,
+      control = loess.control("direct")) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_temp_no2_hr.RDS"))
+
+
+loess(Temp ~ Time_hour2, data = temp_hr$`US Lab`, span = 0.1,
+      control = loess.control("direct")) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_temp_lab_hr.RDS"))
+
+
+# CO2
+co2_hr <- readRDS(file.path(dir.path, "co2_hourly.RDS")) %>%
+  mutate(Time_hour2 = as.numeric(Time_hour)) # LOESS only works on numeric domains
+
+loess(CO2 ~ Time_hour2, data = co2_hr, span = 0.1,
+      control = loess.control("direct")) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_co2_hr.RDS"))
+
+# O2
+ppo2_hr <- readRDS(file.path(dir.path, "ppo2_hr.rds")) %>%
+  mutate(Time_hour2 = as.numeric(Time_hour)) # LOESS only works on numeric domains
+
+loess(ppO2 ~ Time_hour2, data = ppo2_hr, span = 0.1,
+                          control = loess.control("direct")) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_ppo2_hr.RDS"))
+
+# Noise - fit separate linear interpolation for day/night observations
+# We want to interpolate using DAILY values b/c otherwise we're just interpolating the last
+# observation from 1 day to the first observation of the next day
+# Since noise has a 24-hour cycle
+noise_day <- readRDS(file.path(dir.path, "noise_day_noloc.rds")) %>%
+  split(., .$Noise_Day)
+# Linear interpolation of day observations
+approxfun(x = noise_day$`TRUE`$Time_day, y = noise_day$`TRUE`$Noise_dBA, rule = 2) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_noise_day1.RDS"))
+# Linear interpolation of night observations
+approxfun(x = noise_day$`FALSE`$Time_day, y = noise_day$`FALSE`$Noise_dBA, rule = 2) %>%
+  saveRDS(file.path(dir.path, "Smoothed Objects/smooth_noise_day2.RDS"))
+```
+
+These smoothed variables were then merged with the RST data to produce the smoothed (variable name ending in `_S`) and smoothed + imputed variables (variable name ending in `_CS`). In the latter case, these variables were formed by using the actual hourly mean value if available, and the smoothed variable otherwise. It was the smoothed + imputed variables ultimately employed in our prediction model:
+
+- `Temp_CS`: temperature
+- `Noise_dBA_CS`: noise
+- `Radiation_Dose_CS`: radiation
+- `Lapses_CS`: predicted lapses
+- `CO2_CS`: CO2
+- `ppO2_CS`: O2
+
+```{r data4, eval = FALSE}
+rst.full_hr <-readRDS(paste0(dir.path, "rst_full_hr.rds")) %>%
+  mutate(Time_hour2 = as.numeric(Time_hour),
+         Time_day2 = as.numeric(Time_day))
+
+# Smoothed noise,  radiation, CO2, and O2
+rst.smooth_hr <- rst.full_hr %>%
+  # Interpolate using daily noise/radiation values
+  smooth_fun(var = "Noise_dBA", day_level = TRUE, smooth.dir = smooth.path) %>%
+  smooth_fun(var = "Radiation_Dose", day_level = TRUE, smooth.dir = smooth.path)  %>%
+  # Interpolate using LOESS hourly values
+  smooth_fun(var = "CO2", day_level = FALSE, smooth.dir = smooth.path) %>%
+  smooth_fun(var = "ppO2", day_level = FALSE, smooth.dir = smooth.path) %>%
+  smooth_fun(var = "Temp", day_level = FALSE, smooth.dir = smooth.path) %>%
+  arrange(Subject_ID, Time_hour) %>%
+  # Remove intermediate variables
+  select(-Time_hour2, -Time_day2)
+
+# Save the smoothed data in the data directory as well as the 
+# Deliverable directory
+saveRDS(rst.smooth_hr, file = file.path(dir.path, "rst_smooth_hr.RDS"))
+saveRDS(rst.smooth_hr, file = file.path(del.path, "rst_smooth_hr.RDS"))
+```
+
+### Update the Data Dictionary
+
+In the final deliverable, we included a cleaned file merging RST, demographic, and environmental data (`rst_clean.RDS`). We wrote a data dictionary (`Data_Dictionary.xlsx`) and the analytic data file (`rst_clean.RDS`) that includes smoothed variables ultimately used in the prediction model.
+
+```{r, eval = FALSE}
+# Read in existing data dictionary file
+data_dic1 <- read_xlsx(file.path(del.path, "Data_Dictionary.xlsx"), sheet = "rst_smooth")
+data_dic2 <- read_xlsx(file.path(del.path, "Data_Dictionary.xlsx"), sheet = "rst_clean")
+
+# Update file with the most current column names in rst_smooth and rst_clean
+cnames1 <- readRDS(paste0(dir.path, "rst_smooth_hr.RDS")) %>%
+  colnames()
+sheet1 <- data.frame(Column.Name = cnames1) %>%
+  full_join(., data_dic1, by = "Column.Name")
+
+cnames2 <- readRDS(paste0(dir.path, "rst_clean.rds")) %>% 
+  colnames()
+sheet2 <- data.frame(Column.Name = cnames2 ) %>%
+  full_join(., data_dic2, by = "Column.Name")
+
+# Write new data dictionary file
+fname = paste0(del.path, "/Data_Dictionary_", Sys.Date(), ".xlsx")
+openxlsx::write.xlsx(list("rst_smooth" = sheet1,
+                "rst_clean" = sheet2), file = fname)
+```
+
+## Analytic Data
+
+To prepare the data for modelling, we further refined the combined RST/environmental/demographic data:
+
+- We limited the data to relevant predictors
+- **Lagged variables:** we also considered that lagged environmental variables (i.e., the value from $k$ observations ago) would be predictive of the current value of LRM-50 at day $t$. Therefore, we created lagged variables for all variables that were time-varying, including the RST, outcome, and environmental measurements. The variable names of the lagged variables end in `_L1`.
+- **Standardized time-in-mission**: we created a new variable, `inflight_time`, which scaled each participant's elapsed inflight mission time to be between 0 and 1, in order to preserve astronaut privacy.
+
+```{r data5, eval = FALSE}
+# Load analytic file
+rst.smooth <- readRDS(paste0(dir.path, "rst_smooth_hr.rds")) %>%
+  # Keep only inflight, morning/evening, and original RST measurements
+  filter(Time_Type == "Flight",
+         Test_Track_Type %in% c("Morning", "Evening")) %>% 
+  select(-Post_PVT_Very_Sleepy) %>%
+  select(Time_hour,
+         abs_days_sub,
+         Subject_ID, 
+         # Overall Performance
+         Overall_Performance, 
+         PVT_Z,
+         Test_Track_Type,
+         # person-level Variables
+         Male, Age_at_Dock, Pre_PVT,
+         # Performance Variables
+         Errors_of_comission:Other,
+         NumValidResp:MeanSRT__ms_,
+         # Sleep variables
+         Low_Workload:Very_stressed,
+         Total_sleep_hrs,
+         # Environmental
+         Radiation_Dose,
+         Noise_dBA,
+         Temp,
+         ppO2, 
+         CO2,
+         ISS_Occupants,
+         # Smoothed environmental variables
+         Radiation_Dose_CS,
+         Noise_dBA_CS,
+         Temp_CS,
+         CO2_CS, 
+         ppO2_CS,
+         # Medication Flags
+         Med_Antihist,
+         Med_SleepAid,
+         Med_Pain,
+         Med_Decongest,
+         # Self-Report Variables
+         Self_PC_1,
+         Low_Workload,
+         Poor_Sleep_Quality,
+         Very_stressed,
+         # Sleep Variables
+         Total_sleep_hrs,
+         Total_sleep_missed,
+         # EVA variables
+         EVA_Today, EVA_Tomorrow,
+         #LRM-50 metric
+         LRM_50,
+         LRM_Z,
+         LRM_mean, LRM_sd,
+         # Predicted Lapses
+         Pred_Avg_Lapses,
+         # Caffeine Flag
+         Caffeine) %>%
+  # Calculate the number of inflight hours elapsed
+  group_by(Subject_ID) %>%
+  mutate(Earliest_hr = min(Time_hour),
+         inflight_hrs_elapsed = as.numeric(difftime(time1 = Time_hour,
+                                       time2 = Earliest_hr, units = "hours")),
+         max_hrs_sub = max(inflight_hrs_elapsed),
+         # Observation number
+         obs_num = 1:n()) %>%
+  group_by(Subject_ID, Test_Track_Type) %>%
+  arrange(Time_hour) %>%
+  # Lagged Variables
+  mutate(Radiation_CS_L1 = lag0(Radiation_Dose_CS, 1),
+       Noise_CS_L1 = lag0(Noise_dBA_CS, 1),
+       CO2_CS_L1 = lag0(CO2_CS,1),
+       ppO2_CS_L1 = lag0(ppO2_CS, 1),
+       ISS_Occupants_L1 = lag0(ISS_Occupants, 1),
+       Temp_CS_L1 = lag0(Temp_CS,1),
+       Overall_Performance_L1 = lag0(Overall_Performance, 1),
+       Med_Antihist_L1 = lag0(Med_Antihist, 1),
+       Med_SleepAid_L1 = lag0(Med_SleepAid, 1),
+       Med_Pain_L1 = lag0(Med_Pain, 1),
+       Med_Decongest_L1 = lag0(Med_Decongest, 1),
+       Errors_Comission_L1 = lag0(Errors_of_comission, 1),
+       Errors_Omission_L1 = lag0(Errors_of_omission, 1),
+       MeanRRT_L1 = lag0(MeanRRT),
+       LRM_50_L1 = lag0(LRM_50),
+       Pred_Lapses_S = na.locf2(Pred_Avg_Lapses),
+       PVT_Z_L1 = lag0(PVT_Z),
+       LRM_Z_L1 = lag0(LRM_Z),
+       Caffeine_L1 = lag0(Caffeine),) %>%
+  ungroup %>%
+  # Turn factor variables into factor
+  mutate(Subject_ID = as.factor(Subject_ID),
+         # Create subj variable for fcr
+         subj = Subject_ID,
+         # Fractional and integer days
+         # person-specific hours elapsed since first in-flight observation
+         abs_inflight_hr = inflight_hrs_elapsed, 
+         Male_l = Male, # True/False
+         Male_n = as.numeric(Male), # Numeric
+         Male = as.factor(Male), # Factor
+         Test_Track_Type_l = (Test_Track_Type == "Morning"),
+         Test_Track_Type_n = as.numeric(Test_Track_Type_l),
+         Test_Track_Type = as.factor(Test_Track_Type),
+         # Carry lapses forward. If all values are 0 for that participant/timetype then
+         # fill in with 0 for now.
+         Pred_Lapses_CS = ifelse(is.na(Pred_Avg_Lapses), Pred_Lapses_S, Pred_Avg_Lapses)) %>% #,
+         #Pred_Lapses_CS = ifelse(is.na(Pred_Lapses_CS), 0, Pred_Lapses_CS)) %>%
+  rowwise %>%
+  # Rescale time to [0,1] for each participant
+  mutate(inflight_time = scales::rescale(inflight_hrs_elapsed, from = c(0, max_hrs_sub), to = c(0,1)),
+         Pred_Lapses_CS = ifelse(is.na(Pred_Lapses_CS), mean(.$Pred_Lapses_CS, na.rm = TRUE), Pred_Lapses_CS)) %>%
+  ungroup %>%
+  arrange(Subject_ID, Time_hour) %>%
+  as.data.frame
+
+saveRDS(rst.smooth,
+        file.path(dir.path, "rst_smooth_hourly.RDS"))
+```
+
+# Variable Selection {.tabset}
+
+Another goal of the project was to identify a subset of the most important predictors of LRM-50. To do so, we used a random forest [@Breiman2001], a machine learning algorithm which employs an ensemble of regression trees. A random forest also calculates two metrics of variable importance:
+
+ - **%IncMSE** indicates the mean increase in MSE when that variable is permuted [higher -> more important]
+ - **IncNodePurity** is the mean increase in node purity (how similar observations are to each other) when splitting on that variable [higher -> more important]
+ 
+We ranked variables based on **%IncMSE** over a series of resampling simulations. In each simulation, 50% of the data was sampled and the importance table, along with the ranks of each variable (in order of decreasing **%IncMSE**) was generated. This was repeated 100 times to get 100 rankings. For each variable, we calculated
+
+- Percent of simulations that the variable ranked in the Top 10
+- Percent of simulations that the variable in the Top 15
+- Min, Max, Mean, and Median ranks over all simulations,
+
+in order to assess how stable these rankings were among randomly selected subsets of the data.
+ 
+```{r, cache = TRUE, eval = TRUE}
+rst.smooth <- readRDS(file.path(dir.path, "rst_smooth_hourly.RDS"))
+```
+
+```{r random_forest_hrly, eval = FALSE}
+set.seed(123123)
+rank_fun_sim(n_sum = 100,  dat = rst.smooth, 
+                         samp_frac = 0.5, outcome = "LRM_50", 
+                         covars = covar_unlag, save.dir = sel.path)
+
+rank_fun_sim(n_sum = 100,  dat = rst.smooth, 
+                         samp_frac = 0.5, outcome = "LRM_Z", 
+                         covars = covar_unlag, save.dir = sel.path)
+```
+
+Ultimately, the most important predictors were selected as the environmental variables and the 10 highest-scoring variables in terms of percentage of simulations where the variable ranked in the Top 10 (`Top10rate`):
+
+```{r}
+# Top 10 + env variables for the model with LRM-50 outcome
+t10_l = c("LRM_50_L1", "Pre_PVT", "Temp_CS", "Self_PC_1", 
+                  "Age_at_Dock", "Noise_dBA_CS", "Radiation_Dose_CS",
+                  "Caffeine",  "Very_stressed",
+                  "ppO2_CS", "CO2_CS")
+ 
+
+# Top 10 + env variables for the model with standardized LRM-50 outcome
+t10_lz = c("LRM_Z_L1", "Self_PC_1","Noise_dBA_CS", "Age_at_Dock",
+           "Pre_PVT", "Total_sleep_hrs", "Temp_CS", "ppO2_CS", "Radiation_Dose_CS",
+           "Pred_Lapses_CS")
+```
+
+## LRM-50 Outcome
+
+```{r, eval = TRUE, results = 'asis'}
+readRDS(file.path(sel.path, "varselect_forest_l_tab.RDS")) %>%
+  mutate(Variable = get_label(Variable)) %>%
+  arrange(desc(Top10rate), desc(Top15rate), MeanRank, MedRank, TopRank, BottomRank, Variable) %>%
+  pandoc.table(split.table = Inf)
+
+nl()
+
+# Plot the first 50 simulations to see how these rankings change
+# Between sims
+readRDS(file.path(sel.path, "varselect_forest_l.RDS")) %>%
+  filter(Sim <= 50) %>%
+  rank_fun_plot
+  
+nl()
+```
+
+## Standardized LRM-50 Outcome
+
+```{r, eval = TRUE, results = 'asis'}
+readRDS(file.path(sel.path, "varselect_forest_lz_tab.RDS")) %>%
+  mutate(Variable = get_label(Variable)) %>%
+  arrange(desc(Top10rate), desc(Top15rate), MeanRank, MedRank, TopRank, BottomRank, Variable) %>%
+  pandoc.table(split.table = Inf)
+
+nl()
+
+# Plot the first 50 simulations to see how these rankings change
+# Between sims
+readRDS(file.path(sel.path, "varselect_forest_lz.RDS")) %>%
+  filter(Sim <= 50) %>%
+  rank_fun_plot
+  
+nl()
+```
+
+# Ensemble Model
+
+We fit the ensemble model on the entire data `rst.smooth`. To do so, we fit a linear mixed effects (LME) model, a functional concurrent regression (FCR) model, and a random forest model on the full data, using either the full set of covariates ("full") or the top most important variables ("top10") and either the LRM-50 outcome or the standardized LRM-50 outcome. Then, the ensemble prediction was the simple average of the predictions from each of these models.
+
+```{r read_in_data, cache = TRUE, eval = F}
+# RST Data with smoothed environmental variables
+rst.smooth <- readRDS(file.path(dir.path, "rst_smooth_hourly.RDS"))
+
+# Top 10 + env variables for the model with LRM-50 outcome
+t10_l = c("LRM_50_L1", "Age_at_Dock", "Noise_dBA_CS",
+          "Pre_PVT", "Self_PC_1", "Temp_CS",
+          "Caffeine", "Radiation_Dose_CS", "Very_stressed", 
+          "Total_sleep_missed",
+          "ppO2_CS", "CO2_CS")
+ 
+
+# Top 10 + env variables for the model with standardized LRM-50 outcome
+t10_lz = c("LRM_Z_L1", "Self_PC_1", "Noise_dBA_CS",
+           "Total_sleep_hrs", "Age_at_Dock",
+           "Pre_PVT", "Temp_CS", "ppO2_CS",
+           "Radiation_Dose_CS", "CO2_CS")
+```
+
+## Ensemble Model
+
+```{r, eval = FALSE}
+# Fit the models on the full data (so, no train/test split)
+# Input:
+# covars = vector of covariates' variable names
+# outcome variable
+# train_dat: training data to fit the model on
+# time variable for FCR
+# k = number of knots for FCR
+# wgt_lrf = weights for the linear mixed effects, random forest, and function concurrent models in the ensemble
+# type: character describing the model 
+# rescale_mse: rescale MSE for standardized LRM-50 outcome?
+# Output (list)
+fit_full_models <- function(covars = covar_mod, outcome = "LRM_50", train_dat = rst.smooth,
+                            time_var = "inflight_time", k = 10, 
+                            # Weights for LME, RF, and FCR
+                            wgt_lrf = c(0.333, 0.333, 0.333),
+                            type = "full", rescale_mse = FALSE){
+  
+  # Obtain name of lagged outcome variable
+  outcome_lag = get_lagged(outcome)
+  outcome_snip = get_snippet(outcome)
+  
+  if (rescale_mse & outcome == "LRM_Z") outcome_snip <- paste0(outcome_snip, "r")
+  # Filename
+  fname = paste0("ensemble_", outcome_snip, "_", type, ".RDS")
+  message(fname)
+  
+  # Fit linear mixed effects model with AR1 correlation
+  form = formula_linear(outcome = outcome, covariates = c(covars, outcome_lag))
+  ran.form = as.formula("~1|Subject_ID")
+  fit_lme = do.call(nlme::lme, list(fixed=form, random=ran.form, 
+                                data = train_dat,
+                                correlation = corAR1(form = ~ obs_num|Subject_ID)))
+  pred_train_lme = predict(fit_lme, train_dat)
+  
+  # Fit random forest
+  form = formula_linear(outcome = outcome, 
+                        covariates = c(covars, outcome_lag))
+  fit_forest = randomForest(form,
+                     data = train_dat)
+  pred_train_for = predict(fit_forest, train_dat)
+  
+  # Fit functional concurrent regression
+  form = formula_fcr(outcome = outcome, covariates = c(covars, outcome_lag),
+                     time_var = time_var, K = k)
+  
+  fit_fcr = do.call(fcr, list(formula = form, argvals = time_var, 
+                          subj = "subj", data = as.data.frame(train_dat),
+                          use_bam = TRUE, nPhi = 1))
+  
+  pred_train_fcr  = predict(fit_fcr, newdata = train_dat, 
+                            se.fit = TRUE)$insample_predictions$fit
+  
+  # Ensemble prediction: combine 3 outcomes using wgt_lrg
+  pred_train_ens = data.frame(pred_train_lme = pred_train_lme,
+                              pred_train_for = pred_train_for,
+                              pred_train_fcr = pred_train_fcr) %>%
+    as.matrix %>%
+    matrixStats::rowWeightedMeans(., w = wgt_lrf)
+  
+  # Full data with the predicted outcome
+  rst_preds = train_dat %>%
+    mutate(lme = pred_train_lme,
+                          forest = pred_train_for,
+                          fcr = pred_train_fcr,
+                          ensemble = pred_train_ens)
+  
+  # Prediction Accuracy diagnostics
+  sd_train = sd(train_dat$LRM_50, na.rm = TRUE)
+  pred_train_mse = rst_preds %>%
+    select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome)) %>%
+    # Mean Squared Error
+    summarize(lme = mean((lme - obs)^2, na.rm = TRUE),
+              forest = mean((forest - obs)^2, na.rm = TRUE),
+              fcr = mean((fcr - obs)^2, na.rm = TRUE),
+              ensemble = mean((ensemble - obs)^2, na.rm = TRUE))  %>%
+    mutate(Variable = "mse_train")
+  
+  pred_train_rmse = pred_train_mse %>%
+    # RMSE/sd
+    mutate(lme = sqrt(lme)/sd_train,
+           forest = sqrt(forest)/sd_train,
+           fcr = sqrt(fcr)/sd_train,
+           ensemble = sqrt(ensemble)/sd_train,
+           Variable = "rmse_train")
+  
+  # For z-scored LRM-50 outcome, rescale the MSE to compare to LRM-50 outcome
+  if (outcome == "LRM_Z" & rescale_mse){
+    sd_train = sd(train_dat$LRM_50, na.rm = TRUE)
+    pred_train_mse = rst_preds %>%
+      select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome), sd = LRM_sd) %>%
+      # Mean Squared Error
+      summarize(lme = mean((sd^2)*(lme - obs)^2, na.rm = TRUE),
+                forest = mean((sd^2)*(forest - obs)^2, na.rm = TRUE),
+                fcr = mean((sd^2)*(fcr - obs)^2, na.rm = TRUE),
+                ensemble = mean((sd^2)*(ensemble - obs)^2, na.rm = TRUE))  %>%
+      mutate(Variable = "mse_train")
+    
+    pred_train_rmse = pred_train_mse %>%
+      # RMSE/sd
+      mutate(lme = sqrt(lme)/sd_train,
+             forest = sqrt(forest)/sd_train,
+             fcr = sqrt(fcr)/sd_train,
+             ensemble = sqrt(ensemble)/sd_train,
+             Variable = "rmse_train")
+  }
+  
+  # Output
+  out = list(
+    # Model Objects
+    obj_lme = fit_lme,
+    obj_forest = fit_forest,
+    obj_fcr = fit_fcr,
+    # Model predictions + input data
+    rst_preds = rst_preds,
+    # MSE and RMSE Diagnostics of ensemble model
+    mse_train = pred_train_mse$ensemble,
+    rmse_train = pred_train_rmse$ensemble)
+  
+  # Save to filename
+  saveRDS(out, file.path(mod.path.final, fname))
+}
+
+# LRM-50 Outcome
+fit_full_models(covars = covar_mod, outcome = "LRM_50",
+                train_dat = rst.smooth, type = "full")
+fit_full_models(covars = t10_l, outcome = "LRM_50",
+                train_dat = rst.smooth, type = "top10")
+
+# LRM-50 (Z-scored) Outcome
+fit_full_models(covars = covar_mod, outcome = "LRM_Z",
+                train_dat = rst.smooth, type = "full")
+fit_full_models(covars = t10_lz, outcome = "LRM_Z",
+                train_dat = rst.smooth, type = "top10")
+
+# LRM-50 (Z-scored) Outcome - Rescale MSE
+fit_full_models(covars = covar_mod, outcome = "LRM_Z",
+                train_dat = rst.smooth, type = "full", rescale_mse = TRUE)
+fit_full_models(covars = t10_lz, outcome = "LRM_Z",
+                train_dat = rst.smooth, type = "top10", rescale_mse = TRUE)
+```  
+
+## Functional Concurrent Regression Heat Maps {.tabset}
+
+Using the fitted functional regression model, we generate heat maps to visualize the relationship between time, environmental variables, and predicted LRM-50.
+
+```{r, eval = FALSE}
+# To display the contour map, fit FCR object on the given time grid
+time_grid = seq(from = 0, to = 1, length.out = 50)
+
+# LRM-50 Outcome
+fcr_grid_obj(preds = "full", covars = covar_mod, outcome = "LRM_50")
+fcr_grid_obj(preds = "top10", covars = t10_l, outcome = "LRM_50")
+
+# Standardized LRM-50 Outcome
+fcr_grid_obj(preds = "full", covars = covar_mod, outcome = "LRM_Z")
+fcr_grid_obj(preds = "top10", covars = t10_lz, outcome = "LRM_Z")
+```
+
+### Radiation
+
+```{r, cache = TRUE, eval = TRUE}
+fcr_obj <- readRDS(file.path(mod.path.final, "fcr_grid_full_l.RDS"))
+
+fcr_heatmap_1var(dat0 = rst.smooth,
+                 fcr_obj, outcome = "LRM_50",
+                 covars = covar_mod,
+                 var1 = "Radiation_Dose_CS",
+                 lrm_lims = c(-35.9, -28))
+```
+
+### Temperature
+
+```{r, cache = TRUE, eval = TRUE}
+fcr_heatmap_1var(dat0 = rst.smooth,
+                 fcr_obj, outcome = "LRM_50",
+                 covars = covar_mod,
+                 var1 = "Temp_CS",
+                 lrm_lims = c(-35.9, -28))
+```
+
+### Noise
+
+```{r, cache = TRUE, eval = TRUE}
+fcr_heatmap_1var(dat0 = rst.smooth,
+                 fcr_obj, outcome = "LRM_50",
+                 covars = covar_mod,
+                 var1 = "Noise_dBA_CS",
+                 lrm_lims = c(-35.9, -28))
+```
+
+### CO2
+
+```{r, cache = TRUE, eval = TRUE}
+fcr_heatmap_1var(dat0 = rst.smooth,
+                 fcr_obj, outcome = "LRM_50",
+                 covars = covar_mod,
+                 var1 = "CO2_CS",
+                 lrm_lims = c(-35.9, -28))
+```
+
+### O2
+
+```{r, cache = TRUE, eval = TRUE}
+fcr_heatmap_1var(dat0 = rst.smooth,
+                 fcr_obj, outcome = "LRM_50",
+                 covars = covar_mod,
+                 var1 = "ppO2_CS",
+                 lrm_lims = c(-35.9, -28))
+```
+                     
+# Prediction Accuracy
+
+We used the following validation schema to determine which model (linear mixed effects, functional regression, random forest, or ensemble) performed best under repeated subsampling of the data. For each of the 4 models, prediction performance was primarily measured in mean squared error (MSE) and was assessed via the following:
+
+For a participant $i$, number of training days $t$, and run number $k$:
+
+1. Define the training data as observations $t$ to $t + k$ for participant $i$, and all observations for all other participants. If participant $i$ has fewer than $t + k$ observations, proceed to the next participant.
+2. Define the testing data as observation $t + k + 1$ for participant $i$.
+3. Evaluate the (mean) squared error on the training set and test set (note that the test set is one data point).
+
+Repeat by looping over all participants, over all $t \in \{5,10,15,... , 50\}$, and over $k$ ranging from 1 to 20. To calculate the MSE in the training/test sets at a given value of $t$, we take the average over all runs within a participant, and then the average over all participants (so that participants with fewer data points are weighted equally). This yields one value of Train/Test MSE for each value of $t$.
+
+## Simulation Results {.tabset}
+
+```{r}
+pred_ensemble <- function(covar_type = "full", outcome = "LRM_50", 
+                          train_dat, test_dat,
+                          time_var = "inflight_time", k = 10, 
+                          # Weights for LME, RF, and FCR
+                          wgt_lrf = c(0.333, 0.333, 0.333),
+                          rescale_mse = FALSE){
+  
+  # Set of covariates
+  covars <- if(covar_type == "full") {
+    covar_mod
+  } else {
+    if (outcome == "LRM_50") t10_l else t10_z
+  }
+  
+  # Lagged outcome variable
+  outcome_lag = get_lagged(outcome)
+  
+  # Predict LME
+  form = formula_linear(outcome = outcome, covariates = c(covars, outcome_lag))
+  ran.form = as.formula("~1|Subject_ID")
+  fit = do.call(nlme::lme, list(fixed=form, random=ran.form, 
+                                data = train_dat,
+                                correlation = corAR1(form = ~ obs_num|Subject_ID)))
+  
+  pred_test_lme = predict(fit, test_dat)
+  pred_train_lme = predict(fit, train_dat)
+  
+  # Predict Random Forest
+  form = formula_linear(outcome = outcome, 
+                        covariates = c(covars, outcome_lag))
+  fit = randomForest(form,
+                     data = train_dat)
+  pred_test_for = predict(fit, test_dat)
+  pred_train_for = predict(fit, train_dat)
+  
+  # Predict Functional Concurrent Regression
+  form = formula_fcr(outcome = outcome, covariates = c(covars, outcome_lag),
+                      time_var = time_var, K = k)
+  
+  fit = do.call(fcr, list(formula = form, argvals = time_var, 
+                          subj = "subj", data = as.data.frame(train_dat),
+                          use_bam = TRUE, argvals.new = test_dat[,time_var], nPhi = 1))
+  
+  pred_test_fcr = predict(fit, newdata = test_dat, se.fit = TRUE)$insample_predictions$fit
+  pred_train_fcr  = predict(fit, newdata = train_dat, se.fit = TRUE)$insample_predictions$fit
+  
+  ############ ENSEMBLE DATA ###############
+  # Ensemble prediction: combine 3 outcomes using wgt_lrg
+  pred_test_ens = data.frame(pred_test_lme = pred_test_lme,
+                             pred_test_for = pred_test_for,
+                             pred_test_fcr = pred_test_fcr) %>%
+    as.matrix %>%
+    matrixStats::rowWeightedMeans(., w = wgt_lrf)
+  
+  pred_train_ens = data.frame(pred_train_lme = pred_train_lme,
+                              pred_train_for = pred_train_for,
+                              pred_train_fcr = pred_train_fcr) %>%
+    as.matrix %>%
+    matrixStats::rowWeightedMeans(., w = wgt_lrf)
+  
+  ######### MODEL PERFORMANCE #########
+  
+  # Full data with the predicted outcome
+  rst_preds_train = train_dat %>%
+    mutate(lme = pred_train_lme,
+           forest = pred_train_for,
+           fcr = pred_train_fcr,
+           ensemble = pred_train_ens)
+  rst_preds_test = test_dat %>%
+    mutate(lme = pred_test_lme,
+           forest = pred_test_for,
+           fcr = pred_test_fcr,
+           ensemble = pred_test_ens)
+  
+    # Rescale MSE?
+  if (outcome == "LRM_Z" & rescale_mse){
+    sd_test = sd(test_dat$LRM_50, na.rm = TRUE)
+    sd_train = sd(train_dat$LRM_50, na.rm = TRUE)
+    # Change sd_test to be sd of the whole data
+    if (nrow(test_dat) == 1){
+      sd_test = sd(train_dat$LRM_50, na.rm = TRUE)
+    }
+    
+    # Train
+    pred_train_mse = rst_preds_train %>%
+      select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome), sd = LRM_sd) %>%
+      # Mean Squared Error
+      summarize(lme = mean((sd^2)*(lme - obs)^2, na.rm = TRUE),
+                forest = mean((sd^2)*(forest - obs)^2, na.rm = TRUE),
+                fcr = mean((sd^2)*(fcr - obs)^2, na.rm = TRUE),
+                ensemble = mean((sd^2)*(ensemble - obs)^2, na.rm = TRUE))  %>%
+      mutate(Variable = "mse_train")
+    
+    # Test
+    pred_test_mse = rst_preds_test %>%
+      select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome), sd = LRM_sd) %>%
+      # Mean Squared Error
+      summarize(lme = mean((sd^2)*(lme - obs)^2, na.rm = TRUE),
+                forest = mean((sd^2)*(forest - obs)^2, na.rm = TRUE),
+                fcr = mean((sd^2)*(fcr - obs)^2, na.rm = TRUE),
+                ensemble = mean((sd^2)*(ensemble - obs)^2, na.rm = TRUE))  %>%
+      mutate(Variable = "mse_test")
+  } else {
+    
+    # Calculate MSE - Test
+    sd_test = sd(test_dat[,outcome], na.rm = TRUE)
+    sd_train = sd(train_dat[,outcome], na.rm = TRUE)
+    # Change sd_test to be sd of the whole data
+    if (nrow(test_dat) == 1){
+      sd_test = sd_train
+    }
+    
+    # Calculate MSE - Train
+    pred_train_mse = rst_preds_train %>%
+      select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome)) %>%
+      # Mean Squared Error
+      summarize(lme = mean((lme - obs)^2, na.rm = TRUE),
+                forest = mean((forest - obs)^2, na.rm = TRUE),
+                fcr = mean((fcr - obs)^2, na.rm = TRUE),
+                ensemble = mean((ensemble - obs)^2, na.rm = TRUE))  %>%
+      mutate(Variable = "mse_train")
+    
+  pred_test_mse = rst_preds_test %>%
+    select(Subject_ID, lme, forest, fcr, ensemble, obs =  all_of(outcome)) %>%
+    # Mean Squared Error
+    summarize(lme = mean((lme - obs)^2, na.rm = TRUE),
+              forest = mean((forest - obs)^2, na.rm = TRUE),
+              fcr = mean((fcr - obs)^2, na.rm = TRUE),
+              ensemble = mean((ensemble - obs)^2, na.rm = TRUE))  %>%
+    mutate(Variable = "mse_test")
+  }
+
+  # Return:
+  # Table of prediction diagnostics
+  # Full data w/ predicted outcome
+  mse_table = rbind(pred_test_mse, pred_test_rmse,
+                    pred_train_mse, pred_train_rmse)
+  out = list(mse_table = mse_table,
+             # Return data with predictions
+             rst_preds_train = rst_preds_train,
+             rst_preds_test = rst_preds_test)
+  
+  return(out)
+}
+
+# Append the participant ID to pred_ensemble output
+pred_ensemble_oos <- function(the_subj = 1001, ...){
+  out = pred_ensemble(...)$`mse_table` %>%
+    mutate(Subject_ID = the_subj)
+  return(out)
+}
+
+# For a given participant (the_subj), split data (dat) as described above
+sample_oos <- function(dat, the_subj = 1001, run_num = 1,
+                       training_days, testing_days = 1){
+  
+  # All other participants = training set
+  dat_others <- dat %>%
+    filter(Subject_ID != the_subj)
+  
+  # For this participant, 
+  dat_subj <- dat %>% filter(Subject_ID == the_subj)
+  
+  # Throw error if not enough data
+  if (training_days + testing_days > nrow(dat_subj)){
+    stop("Not enough data to split into the training/test days specified.")
+  }
+ 
+  inds_train = seq(from = run_num,
+                   to = run_num + training_days - 1)
+  inds_test = seq(from = run_num + training_days,
+                  to = run_num + training_days + testing_days - 1)
+  
+  # Throw error if not enough data
+  if (!all(inds_train < nrow(dat_subj))){
+    stop("Not enough training data")
+  }
+  if (!all(inds_test < nrow(dat_subj))){
+    stop("Not enough testing data")
+  }
+  
+  dat_train <- dat_others %>%
+    bind_rows(dat_subj %>% slice(inds_train)) %>%
+    arrange(Subject_ID, inflight_time)
+  
+  dat_test <- dat_subj %>%
+    slice(inds_test)
+  
+  return(list(Train = dat_train, Test = dat_test, 
+              # Actual number of rows in train/test for this participant
+              train_n = length(inds_train),
+              test_n = length(inds_test)))
+}
+
+# For a dataset (dat0) and participant (the_subj),
+# Split the data based on the number of training/test days (training_days/testing_days)
+# Using either full, or top 10 covariates (covar_type)
+# and a given outcome variable
+divide_data_oos <- function(dat0 = rst.smooth, the_subj = 1001, training_days = 30,
+                            testing_days = 1, covar_type = "full",
+                            outcome = "LRM_50", mod_path = day1.path,
+                            rescale_mse = FALSE){
+  stopifnot(training_days >= 5)
+  stopifnot(covar_type %in% c("full", "top10"))
+  
+  # For each participant, sort the data by time
+  dat <- dat0 %>%
+    arrange(Subject_ID, inflight_time)
+  
+  N_subj = dat %>% filter(Subject_ID == the_subj) %>%
+    nrow()
+  run_seq = seq(from = 1,
+                to = min(20, N_subj - testing_days - training_days))
+  
+  for (i in run_seq){
+    # Split data into training and test sets
+    rst.split <- sample_oos(dat = dat, the_subj = the_subj, run_num = i,
+                            training_days = training_days, testing_days = testing_days)
+    
+    rst.train <- rst.split[["Train"]]
+    rst.test <- rst.split[["Test"]]
+    
+    # Number of participants
+    n_train = rst.split[["train_n"]]
+    n_test = rst.split[["test_n"]]
+    
+    # Outcome
+    out_snip = get_snippet(outcome)
+    if (outcome == "LRM_Z" & rescale_mse) out_snip = paste0(out_snip, "r")
+    
+    # Select/create model directory
+    mod_save_dir <-  file.path(mod_path, paste0("OOS_", out_snip, "_", covar_type))
+    if (!dir.exists(mod_save_dir)) dir.create(mod_save_dir)
+    
+    # Run ensemble model
+    fname_out = paste0("r", i, "_train", training_days, "_test", 
+                       testing_days, "_" ,the_subj, ".RDS")
+    message(paste0("Saving ", file.path(paste0("OOS_", out_snip, "_", covar_type),
+                                        fname_out)))
+    
+    # Predict ensemble
+    pred_all = pred_ensemble_oos(the_subj = the_subj,
+                                 covar_type = covar_type, outcome = "LRM_50", 
+                                 train_dat = rst.train, test_dat = rst.test,
+                                 rescale_mse = rescale_mse) %>%
+      mutate(Run = i,
+             Training_Days = training_days,
+             Train_actual = n_train,
+             Testing_days = testing_days,
+             Test_actual = n_test)
+    
+    # Save this file
+    saveRDS(pred_all, file.path(mod_save_dir, fname_out))
+  }
+  
+}
+```
+
+```{r}
+# Run the code
+# Out-of-sample preds\
+train_seq = seq(from = 5, to = 50, by = 5)
+all_subs = unique(rst.smooth$Subject_ID) %>% as.character
+
+for (i in train_seq){ # Over all numbers of training days
+  
+  # Full set of covariates
+  parallel::mclapply(X = all_subs,
+                     FUN = divide_data_oos,
+                     dat0 = rst.smooth,
+                     training_days = i, testing_days = 1,
+                     covar_type = "full", outcome = "LRM_50",
+                     mod_path = day1.path,
+                     mc.cores = n_cores)
+  
+  # Top 10 covariates
+    parallel::mclapply(X = all_subs,
+                     FUN = divide_data_oos,
+                     dat0 = rst.smooth,
+                     training_days = i, testing_days = 1,
+                     model_type = "top10", outcome = "LRM_50",
+                     mod_path = day1.path,
+                     mc.cores = n_cores)
+}
+
+# Summarize data for plots
+# list files and process
+list.files(file.path(day1.path, "OOS_l_full"),
+           full.names = TRUE, pattern = ".RDS") %>%
+  map(readRDS) %>%
+  Reduce(rbind,.) %>%
+  # Take average over all participants, variables, and Training Days
+  group_by(Variable, Training_Days) %>%
+  summarize_at(c("lme", "forest", "fcr", "ensemble"), 
+               mean, na.rm = TRUE) %>%
+  gather(Model, Value, -Variable, -Training_Days) %>%
+  mutate(Model0 = Model,
+         Model = recode_factor(Model0,
+                               "fcr"= "Functional Concurrent Regression",
+                               "forest" = "Random Forest",
+                               "lme" = "Linear Mixed Effects",
+                               "ensemble" = "Ensemble")) %>%
+  saveRDS(file.path(mod.path, "performance_OOS_l_full.RDS"))
+
+
+list.files(file.path(day1.path, "OOS_l_top10"),
+           full.names = TRUE, pattern = ".RDS") %>%
+  map(readRDS) %>%
+  Reduce(rbind,.) %>%
+  # Take average over all participants, variables, and Training Days
+  group_by(Variable, Training_Days) %>%
+  summarize_at(c("lme", "forest", "fcr", "ensemble"), 
+               mean, na.rm = TRUE) %>%
+  gather(Model, Value, -Variable, -Training_Days) %>%
+  mutate(Model0 = Model,
+         Model = recode_factor(Model0,
+                               "fcr"= "Functional Concurrent Regression",
+                               "forest" = "Random Forest",
+                               "lme" = "Linear Mixed Effects",
+                               "ensemble" = "Ensemble")) %>%
+  saveRDS(file.path(mod.path, "performance_OOS_l_top10.RDS"))
+
+list.files(file.path(day1.path, "OOS_lzr_full"),
+           full.names = TRUE, pattern = ".RDS") %>%
+  map(readRDS) %>%
+  Reduce(rbind,.) %>%
+  # Take average over all participants, variables, and Training Days
+  group_by(Variable, Training_Days) %>%
+  summarize_at(c("lme", "forest", "fcr", "ensemble"), 
+               mean, na.rm = TRUE) %>%
+  gather(Model, Value, -Variable, -Training_Days) %>%
+  mutate(Model0 = Model,
+         Model = recode_factor(Model0,
+                               "fcr"= "Functional Concurrent Regression",
+                               "forest" = "Random Forest",
+                               "lme" = "Linear Mixed Effects",
+                               "ensemble" = "Ensemble")) %>%
+  saveRDS(file.path(mod.path, "performance_OOS_lzr_full.RDS"))
+
+list.files(file.path(day1.path, "OOS_lzr_top10"),
+           full.names = TRUE, pattern = ".RDS") %>%
+  map(readRDS) %>%
+  Reduce(rbind,.) %>%
+  # Take average over all participants, variables, and Training Days
+  group_by(Variable, Training_Days) %>%
+  summarize_at(c("lme", "forest", "fcr", "ensemble"), 
+               mean, na.rm = TRUE) %>%
+  gather(Model, Value, -Variable, -Training_Days) %>%
+  mutate(Model0 = Model,
+         Model = recode_factor(Model0,
+                               "fcr"= "Functional Concurrent Regression",
+                               "forest" = "Random Forest",
+                               "lme" = "Linear Mixed Effects",
+                               "ensemble" = "Ensemble")) %>%
+  saveRDS(file.path(mod.path, "performance_OOS_lzr_top10.RDS"))
+```
+
+```{r eval = TRUE}
+# Plot prediction performance
+# Plot prediction performance
+plot_fun_oos <- function(dir_dat = day1.path, covar_type = "full", outcome = "LRM_50"){
+  
+  out_snip = switch(outcome, "LRM_50" = "l", "LRM_Z" = "lzr")
+  
+  fname <- file.path(dir_dat, 
+                     paste0("performance_OOS_", out_snip, "_", covar_type, ".RDS"))
+  all_dat <- readRDS(fname)
+  
+  vars = c("lme", "forest", "fcr", "ensemble")
+  
+  perf_dat_mse <- all_dat %>%
+    filter(Model0 %in% vars) %>%
+    select(Model, Training_Days, Variable, Value) %>%
+    mutate(Variable = recode(Variable,
+                             "mse_train" = "MSE (Train)",
+                             "mse_test" = "MSE (Test)",
+                             "rmse_train" = "RMSE/sd (Train)",
+                             "rmse_test" = "RMSE/sd (Test)"),
+           Variable = factor(Variable,
+                             levels = c("MSE (Train)", "MSE (Test)",
+                                        "RMSE/sd (Train)", "RMSE/sd (Test)")))
+  
+  perf_dat_rmse <- all_dat %>%
+    filter(Model0 %in% vars) %>%
+    mutate(Variable2 = ifelse(Variable == "mse_test", "rmse_test", "rmse_train")) %>%
+    select(Model, Training_Days, Variable = Variable2, Value = RMSE_sd) %>%
+    mutate(Variable = recode(Variable,
+                             "mse_train" = "MSE (Train)",
+                             "mse_test" = "MSE (Test)",
+                             "rmse_train" = "RMSE/sd (Train)",
+                             "rmse_test" = "RMSE/sd (Test)"),
+           Variable = factor(Variable,
+                             levels = c("MSE (Train)", "MSE (Test)",
+                                        "RMSE/sd (Train)", "RMSE/sd (Test)")))
+    
+    perf_dat <- bind_rows(perf_dat_mse, perf_dat_rmse) 
+  
+   # Format title
+  # string1 <- "Out-of-sample"
+  string1 = paste0(get_label(outcome), " Outcome, ")
+  string2 <- switch(covar_type,
+                    "full" = "Full Covariates",
+                    "top10" = "Top 10 Covariates",
+                    "top10nn" = "Top 10 (No Noise) Covariates",
+                    "topany" = "Top 10 (+ Env) Covariates",
+                    "topanynn" = "Top 10 (+ Env - Noise) Covariates")
+  string3 = paste0(string1, string2)
+  
+   # Plot
+  p_perf_mse = ggplot(perf_dat_mse) +
+    geom_point(aes(x = Value, y = Training_Days,
+                   color = Model, shape = Model)) +
+    scale_color_manual(breaks = c("Functional Concurrent Regression", "Random Forest", "Linear Mixed Effects", "Ensemble"),
+                       values = c("#117733", "#CC6677", "#88CCEE", "#332288")) +
+    scale_shape_manual(breaks = c("Functional Concurrent Regression", "Random Forest", "Linear Mixed Effects", "Ensemble"),
+                       values = c(2, 4, 8, 16)) +
+    facet_wrap(~Variable, scales = "fixed") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          text = element_text(size = 10)) +
+    labs(x = "", y = "", title = string3)
+  
+    p_perf_rmse = ggplot(perf_dat_rmse) +
+    geom_point(aes(x = Value, y = Training_Days,
+                   color = Model, shape = Model)) +
+    scale_color_manual(breaks = c("Functional Concurrent Regression", "Random Forest", "Linear Mixed Effects", "Ensemble"),
+                       values = c("#117733", "#CC6677", "#88CCEE", "#332288")) +
+    scale_shape_manual(breaks = c("Functional Concurrent Regression", "Random Forest", "Linear Mixed Effects", "Ensemble"),
+                       values = c(2, 4, 8, 16)) +
+    facet_wrap(~Variable, scales = "fixed") +
+    theme_minimal() +
+    theme(legend.position = "none",
+          text = element_text(size = 10)) +
+    labs(x = "Prediction Error", y = "Days in Training Set", title = string3)
+    
+    p_perf = arrangeGrob(p_perf_mse, p_perf_rmse, ncol = 1)
+  
+  # Table: same data as plot
+  tab_perf = perf_dat %>%
+    pivot_wider(names_from = "Model", values_from = "Value")  %>%
+    group_by(Variable) %>%
+    summarize_at(vars(`Linear Mixed Effects`:`Ensemble`), mean)
+  
+  # Table 2: same data as plot, but averaged over t
+  tab_perf_avg = perf_dat %>%
+    pivot_wider(names_from = "Model", values_from = "Value") %>%
+    filter(Variable %in%  c("MSE (Train)","MSE (Test)")) %>%
+    group_by(Variable) %>%
+    summarize_at(vars(`Linear Mixed Effects`:`Ensemble`), mean)
+  
+  return(list(p_perf, tab_perf, tab_perf_avg))
+}
+
+
+rank_table_fun_oos <- function(dir_dat = day1.path, covar_type = "full", outcome = "LRM_50"){
+  
+  out_snip = switch(outcome, "LRM_50" = "l", "LRM_Z" = "lzr")
+  
+  fname <- file.path(dir_dat, 
+                     paste0("performance_OOS_", out_snip, "_", covar_type, ".RDS"))
+  all_dat <- readRDS(fname)
+  
+  vars = c("lme", "forest", "fcr", "ensemble")
+  
+  perf_dat_mse <- all_dat %>%
+    filter(Model0 %in% vars) %>%
+    select(Model, Training_Days, Variable, Value)
+  
+  perf_dat_rmse <- all_dat %>%
+    filter(Model0 %in% vars) %>%
+    mutate(Variable2 = ifelse(Variable == "mse_test", "rmse_test", "rmse_train")) %>%
+    select(Model, Training_Days, Variable = Variable2, Value = RMSE_sd)
+    
+  bind_rows(perf_dat_mse, perf_dat_rmse) %>%
+    # For each value of Training_Days, rank the models
+    group_by(Training_Days, Variable) %>%
+    mutate(Rank = rank(Value)) %>%
+    group_by(Model, Variable) %>%
+    summarize(Mean_Rank = mean(Rank)) %>%
+    arrange(Variable, Mean_Rank) %>%
+    filter(Variable %in% c("mse_test")) %>%
+    pandoc.table(split.table = Inf)
+  
+}
+```
+
+### Full Covariates
+
+
+```{r eval = TRUE}
+# Performance, by t
+plot_fun_oos(covar_type = "full", outcome = "LRM_50")[[1]] %>% grid.draw()# Performance averaged over t
+plot_fun_oos(covar_type = "full", outcome = "LRM_50")[[3]] %>% pt()
+# Rank table
+rank_table_fun_oos(covar_type = "full", outcome = "LRM_50")
+```
+
+### Top 10 Covariates
+
+```{r eval = TRUE}
+# Performance, by t
+plot_fun_oos(covar_type = "top10", outcome = "LRM_50")[[1]] %>% grid.draw()# Performance averaged over t
+plot_fun_oos(covar_type = "top10", outcome = "LRM_50")[[3]] %>% pt()
+# Rank table
+rank_table_fun_oos(covar_type = "top10", outcome = "LRM_50")
+```
+
+Overall, the ensemble model displayed the smallest MSE across all simulations and participants in the test set. As expected, the random forest model had the smallest MSE in the training set, but it appears to overfit on the data, performing worse than the ensemble model in the unseen test data.
+
+### Full Covariates (LRM-Z)
+
+```{r eval = TRUE}
+# Performance, by t
+plot_fun_oos(covar_type = "full", outcome = "LRM_Z")[[1]] %>% grid.draw()# Performance averaged over t
+plot_fun_oos(covar_type = "full", outcome = "LRM_Z")[[3]] %>% pt()
+# Rank table
+rank_table_fun_oos(covar_type = "full", outcome = "LRM_Z")
+```
+
+### Top 10 Covariates (LRM-Z)
+
+```{r eval = TRUE}
+# Performance, by t
+plot_fun_oos(covar_type = "top10", outcome = "LRM_Z")[[1]] %>% grid.draw()# Performance averaged over t
+plot_fun_oos(covar_type = "top10", outcome = "LRM_Z")[[3]] %>% pt()
+# Rank table
+rank_table_fun_oos(covar_type = "top10", outcome = "LRM_Z")
+```
+
+# Appendix: Helper Functions
+
+This was saved as `helpers.R` in the `code.path` directory and sourced at the beginning of this code.
+
+```{r}
+# helpers.R
+
+# RMarkdown Formatting ----------------------------------------------------
+
+# New Line
+nl <- function(){
+  cat("  \n")
+}
+
+# Print subheading from within R code chunk
+subheading <- function(text){
+  cat(text)
+  nl()
+}
+
+
+# Data Processing ---------------------------------------------------------
+
+# For a vector x, do LOCF (last-value-carried-forward)
+# imputation. If x begins with NA's, carry the first non-NA
+# observation backward also
+# e.g. na.locf2(c(NA, 1, 2, NA)) = c(1,1,2,2)
+na.locf2 <- function(x){
+  x_first = x[!is.na(x)][1]
+  x_out = na.locf(x, na.rm = FALSE, fromLast = FALSE)
+  x_out[is.na(x_out)] = x_first
+  
+  return(x_out)
+}
+
+# Wrapping around the lag function, setting 0 as the default value instead of NA
+lag0 <- function(...){
+  lag(..., default = 0)
+}
+
+# For a given vector, delete entries that are repeated more than nreps times in a row
+# and replace these values with NA
+delete_reps <- function(x, nreps = 3){
+  # Get the run length encoding of x
+  rle_x = rle(x)
+  # Identify indices of x that have been repeated >= 3 times
+  ind = rep(rle_x$lengths >= nreps,times = rle_x$lengths)
+  # Replace with NA
+  x[ind] <- as.numeric(NA)
+  
+  return(x)
+}
+
+# Smooth environmental variables
+# dat0 = RST data
+# var = name of environmental variable
+# smooth.dir = location of the LOESS/linear interpolation objects
+smooth_fun <- function(dat0, var, day_level = TRUE, smooth.dir){
+  stopifnot(var %in% c("Radiation_Dose", "Noise_dBA", "Temp", "CO2", "ppO2"))
+  
+  snip = ifelse(day_level, "day", "hr")
+  
+  if (var == "Radiation_Dose"){
+    # Read in smooth object
+    smooth_obj = readRDS(file.path(smooth.dir, "smooth_rad.RDS"))
+    
+    # Add to data
+    smooth_dat <- dat0 %>%
+      mutate(Radiation_Dose_S = predict(smooth_obj, dat0),
+             Radiation_Dose_CS = ifelse(is.na(Radiation_Dose), Radiation_Dose_S, Radiation_Dose))
+  }
+  
+  if (var == "Temp"){
+    # Read in smooth object
+    smooth_obj = list(avg = readRDS(file.path(smooth.dir, paste0("smooth_temp_avg_", snip, ".RDS"))),
+                      no2 = readRDS(file.path(smooth.dir, paste0("smooth_temp_no2_", snip, ".RDS"))),
+                      lab = readRDS(file.path(smooth.dir, paste0("smooth_temp_lab_", snip, ".RDS"))))
+    
+    # Day-level 
+    if (day_level){
+      # Predictions for each location
+      preds <- data.frame(Avg = predict(smooth_obj$avg, dat0),
+                          No2 = predict(smooth_obj$no2, dat0),
+                          Lab = predict(smooth_obj$lab, dat0))
+      
+      smooth_dat <- dat0 %>%
+        # Add columns of preds
+        cbind(preds) %>%
+        mutate(Temp_S = ifelse(Location == "Node 2", No2, as.numeric(NA)),
+               Temp_S = ifelse(Location == "US Lab", Lab, Temp_S),
+               Temp_S = ifelse(Location == "Avg", Avg, Temp_S),
+               # Only interpolate if Temp is NA
+               Temp_CS = ifelse(is.na(Temp), Temp_S, Temp))
+    } else {
+      # Hourly level
+      # Smoothed temp
+      tmp <- dat0 %>% select(Time_hour2) %>% distinct
+      
+      smooth_obj = list(avg = readRDS(file.path(smooth.path, paste0("smooth_temp_avg_hr.RDS"))),
+                        no2 = readRDS(file.path(smooth.path, paste0("smooth_temp_no2_hr.RDS"))),
+                        lab = readRDS(file.path(smooth.path, paste0("smooth_temp_lab_hr.RDS"))))
+      
+      preds <- data.frame(Avg = predict(smooth_obj$avg, tmp),
+                          No2 = predict(smooth_obj$no2, tmp),
+                          Lab = predict(smooth_obj$lab, tmp),
+                          Time_hour2 = tmp$Time_hour2) %>%
+        gather(Location, Temp_S, -Time_hour2) %>%
+        mutate(Location = recode(Location, "No2" = "Node 2", "Lab" = "US Lab"))
+      
+      smooth_dat <- dat0 %>%
+        left_join(preds, by = c("Time_hour2", "Location")) %>%
+        mutate(Temp_CS = ifelse(is.na(Temp), Temp_S, Temp))
+      
+    }
+  }
+  
+  if (var == "ppO2"){
+    # Read in smooth object
+    smooth_obj = readRDS(file.path(smooth.dir, paste0("smooth_ppo2_", snip, ".RDS")))
+    
+    # Add to data
+    smooth_dat <- dat0 %>%
+      mutate(ppO2_S = predict(smooth_obj, dat0),
+             ppO2_CS = ifelse(is.na(ppO2), ppO2_S, ppO2))
+  }
+  
+  if (var == "CO2"){
+    # Read in smooth object
+    smooth_obj = readRDS(file.path(smooth.dir, paste0("smooth_co2_", snip, ".RDS")))
+    
+    # Add to data
+    smooth_dat <- dat0 %>%
+      mutate(CO2_S = predict(smooth_obj, dat0),
+             CO2_CS = ifelse(is.na(CO2), CO2_S, CO2))
+  }
+  
+  if (var == "Noise_dBA"){
+    # Read in smooth object
+    smooth_obj = list(Day = readRDS(file.path(smooth.dir, paste0("smooth_noise_", snip, "1.RDS"))),
+                      Night = readRDS(file.path(smooth.dir, paste0("smooth_noise_", snip, "2.RDS"))))
+    
+    # Add to data
+    if (day_level){
+      smooth_dat <- dat0 %>%
+        mutate(Noise_dBA_S = ifelse(Noise_Day, smooth_obj$Day(Time_day), smooth_obj$Night(Time_day)),
+               Noise_dBA_CS = ifelse(is.na(Noise_dBA), Noise_dBA_S, Noise_dBA))
+    } else {
+      smooth_dat <- dat0 %>%
+        mutate(Noise_dBA_S = ifelse(Noise_Day, smooth_obj$Day(Time_hour), smooth_obj$Night(Time_hour)),
+               Noise_dBA_CS = ifelse(is.na(Noise_dBA), Noise_dBA_S, Noise_dBA))
+    }
+  }
+  
+  return(smooth_dat)
+  
+}
+
+# dat = RST data
+# n_days = split data so that the testing set has the last n_days per participant,
+# and the training set has all the preceding data
+divide_data_day <- function(dat = rst.smooth, n_days = 15){
+  ## Prediction
+  ## Form training and test sets by splitting data in half by person
+  rst.split <- dat %>%
+    filter(Test_Track_Type != "Other") %>%
+    # For each participant and test type, split data in two
+    group_by(Subject_ID) %>%
+    arrange(abs_days_sub) %>%
+    mutate(max_day = max(abs_days_sub),
+           Test = (abs_days_sub > (max_day-n_days))) %>%
+    split(.$Test) %>%
+    purrr::map(ungroup) %>%
+    purrr::map(as.data.frame)
+  
+  return(rst.split)
+}
+
+# Similar to divide_data_day, but uses # observations instead of the number of days
+divide_data_obs_subj <- function(dat_subj, n_train_obs = NULL, n_test_obs){
+  n_subj = nrow(dat_subj)
+  
+  # If n_train_obs not provided, just use all data available
+  if (is.null(n_train_obs)){
+    dat_subj2 <- dat_subj %>%
+      mutate(obs2 = 1:n(),
+             Test = (obs2 %in% tail(x = obs2, n = n_test_obs)))
+    
+    return(dat_subj2)
+  } 
+  
+  # If there isn't enough data to train on n_train_obs days
+  # just use the days available
+  if ((n_train_obs + n_test_obs) > n_subj){
+    dat_subj2 <- dat_subj %>%
+      mutate(obs2 = 1:n(),
+             Test = (obs2 %in% tail(x = obs2, n = n_test_obs)))
+  } else {
+    # Otherwise, split data into the first n_train_obs observations
+    # And the following n_test_obs observations
+    total_obs = n_train_obs + n_test_obs
+    
+    dat_subj2 <- dat_subj %>%
+      mutate(obs2 = 1:n()) %>%
+      filter(obs2 <= total_obs) %>%
+      mutate(Test = (obs2 > n_train_obs)) 
+  }
+  
+  return(dat_subj2)
+  
+}
+
+divide_data_obs <- function(dat = rst.smooth, n_train_obs, n_test_obs = 1){
+  
+  # If # training obs not provided, use all data minus testing data
+  if (missing(n_train_obs)){
+    rst.split <- dat %>%
+      filter(Test_Track_Type != "Other") %>%
+      # For each participant and test type, split data in two
+      split(.$Subject_ID) %>%
+      map(divide_data_obs_subj, n_test_obs = n_test_obs) %>%
+      Reduce(rbind,.)
+  } else {
+    rst.split <- dat %>%
+      filter(Test_Track_Type != "Other") %>%
+      # For each participant and test type, split data in two
+      split(.$Subject_ID) %>%
+      map(divide_data_obs_subj, n_train_obs = n_train_obs, n_test_obs = n_test_obs) %>%
+      Reduce(rbind,.)
+  }
+  
+  out = rst.split %>%
+    split(.$Test) %>%
+    purrr::map(ungroup) %>%
+    purrr::map(as.data.frame)
+  return(out)
+}
+
+
+# Variable Names ----------------------------------------------------------
+
+# Get variable label, given vector of variable names
+get_label <- function(varnames){
+  x = data.frame(Var = varnames) %>%
+    left_join(vars_and_labels, by = "Var") %>%
+    mutate_all(as.character) %>%
+    mutate(Label = ifelse(is.na(Label), Var, Label))
+  return(as.character(x$Label))
+}
+
+# Get lagged outcome variable, given name
+get_lagged <- function(outcome){
+  # Obtain name of lagged outcome variable
+  outcome_lag = switch(outcome,
+                       "Overall_Performance" = "Overall_Performance_L1",
+                       "LRM_50" = "LRM_50_L1", 
+                       "PVT_Z" = "PVT_Z_L1",
+                       "LRM_Z" = "LRM_Z_L1",
+                       "MeanRRT" = "MeanRRT_L1",
+                       "Errors_of_omission" = "Errors_Omission_L1", 
+                       "Errors_of_comission" = "Errors_Comission_L1")
+  
+  return(outcome_lag)
+}
+
+# Get the short version of a variable name (for filenames)
+get_snippet <- function(outcome){
+  outcome_snip <- switch(outcome,
+         "Overall_Performance" = "o",
+         "LRM_50" = "l",
+         "LRM_Z" = "lz",
+         "PVT_Z" = "pz")
+  return(outcome_snip)
+}
+
+
+# Unlagged covariates
+covar_unlag = c("Radiation_Dose_CS", "Noise_dBA_CS", "CO2_CS", "ppO2_CS", 
+                "ISS_Occupants", "Temp_CS", "Male", "Age_at_Dock", "Pre_PVT", 
+                "Med_SleepAid", "Med_Antihist", "Med_Pain", "Med_Decongest",
+                "Test_Track_Type","Self_PC_1","Low_Workload","Poor_Sleep_Quality","Very_stressed",
+                "Total_sleep_hrs","Total_sleep_missed", "Pred_Lapses_CS", "EVA_Today", 
+                "EVA_Tomorrow", "Caffeine")
+
+# Covariates we'll keep for modelling
+covar_mod <-  c("Radiation_Dose_CS", "Noise_dBA_CS", "CO2_CS", "ppO2_CS", 
+                "ISS_Occupants", "Temp_CS", "Male", "Age_at_Dock",
+                "Pre_PVT", "Med_SleepAid", "Med_Antihist",
+                "Test_Track_Type","Self_PC_1","Low_Workload","Poor_Sleep_Quality","Very_stressed",
+                "Total_sleep_hrs", "Total_sleep_missed", "Pred_Lapses_CS",
+                "Caffeine")
+
+# Non-time-varying covariates
+covar_nontv = c("Male", "Age_at_Dock", "Pre_PVT", "Test_Track_Type")
+
+# Model Building ----------------------------------------------------------
+
+# Build formula object for linear model
+formula_linear <- function(outcome = "Overall_Performance", covariates){
+  form0 = paste0(covariates, collapse = " + ")
+  form = paste0(outcome, " ~ ", form0)
+  return(as.formula(form))
+}
+
+# Build formulat object for functional concurrent model
+# using bivariate smooth terms
+formula_fcr <- function(outcome = "LRM_50",
+                         covariates,
+                         time_var = "inflight_time", K){
+  
+  # Glue together terms with time-varying effects
+  cov_tv = setdiff(covariates, covar_nontv)
+  form_tv0 = paste0("s(", time_var, ", ", cov_tv, ", k = ", K, ", bs = 'tp')")
+  form_tv = form_tv0 %>%
+    paste0(collapse = " + ")
+  
+  # Glue together terms with non-time-varying effects
+  cov_ntv = intersect(covariates, covar_nontv)
+  if (length(cov_ntv > 0)){
+    form_ntv = paste0(cov_ntv, collapse = " + ")
+    form0 = paste0(form_tv, " + ", form_ntv) 
+  } else {
+    form0 = form_tv
+  }
+  
+  form = paste0(outcome, # Outcome
+                # Random effect
+                " ~ s(", 
+                time_var, 
+                ", k = ", K, ", bs = 're') + ",
+                # Covariates
+                form0) 
+  return(as.formula(form))
+}
+
+# Variable Selection ------------------------------------------------------
+
+# dat: data set
+# samp_frac: the fraction used to split data into Train/Test sets
+# outcome = outcome variable
+# covars = vector of predictors' variable names
+forest_rank_table <- function(n, dat = rst.smooth, samp_frac = 0.5,
+                              outcome = "LRM_50", covars = covar_unlag){
+  
+  # Get varname of lagged outcome
+  outcome_lag <- get_lagged(outcome)
+  
+  # Subsample data by fraction of samp_frac
+  dat2 <- dat %>%
+    sample_frac(samp_frac)
+  
+  # Random Forest importance table
+  rf = randomForest(formula_linear(outcome = outcome,  covariates = c(covars, outcome_lag)), 
+                    data = dat2, importance = TRUE)
+  
+  rank_table <- rf %>%
+    importance() %>%
+    as.data.frame() %>%
+    rownames_to_column("Variable") %>%
+    arrange(desc(`%IncMSE`)) %>%
+    mutate(Rank = 1:n()) %>%
+    select(Variable, Rank)
+  
+  rank_table <- rank_table %>%
+    mutate(Top10 = (Rank <= 10),
+           Top15 = (Rank <= 15),
+           Sim = n)
+  return(rank_table)
+  
+}
+
+# n_sum: number of times to run forest_rank_table()
+# save.dir: optional location to save the outcome of the simulations
+rank_fun_sim <- function(n_sum = 100, 
+                         dat = rst.smooth, 
+                         samp_frac = 0.5,
+                         outcome = "LRM_50", 
+                         covars = covar_unlag,
+                         save.dir = sel.path){
+  # String associated with outcome
+  outcome3 <- get_snippet(outcome)
+  
+  # Ranks of each variable
+  ranks = parallel::mclapply(X = as.list(1:n_sum),
+                             FUN = forest_rank_table, dat = dat, samp_frac = samp_frac,
+                             outcome = outcome, covars = covars, mc.cores = n_cores) %>%
+    Reduce(rbind,.)
+  
+  # Save all of the ranks
+  fname = paste0("varselect_forest_", outcome3, ".rds")
+  saveRDS(ranks, file.path(save.dir, fname))
+  
+  # Get the output table
+  fname2 = paste0("varselect_forest_", outcome3, "_tab.rds")
+  ranks_table <- ranks %>%
+    group_by(Variable) %>%
+    summarize(Top10rate = mean(Top10),
+              Top15rate = mean(Top15),
+              TopRank = min(Rank),
+              MeanRank = mean(Rank),
+              MedRank = median(Rank),
+              BottomRank = max(Rank)) %>%
+    arrange(desc(Top10rate))
+  saveRDS(ranks_table,
+          file.path(save.dir, fname2))
+}
+
+
+# Plot the rankings
+rank_fun_plot <- function(dat_rank){
+  dat_rank <- dat_rank %>%
+    left_join(vars_and_labels, by = c("Variable" = "Var")) %>%
+    dplyr::select(-Variable) %>%
+    dplyr::select(Variable = Label, everything())
+  
+  var_levels = dat_rank %>% 
+    arrange(Sim, Rank) %>% 
+    dplyr::select(Variable) %>% 
+    distinct %>% `[[`(1)
+  
+  rank_levels = rev(rev(unique(dat_rank$Rank)))
+  
+  dat_rank <- dat_rank %>%
+    mutate(Variable = factor(Variable, levels = var_levels))
+  p <- ggplot(dat_rank) +
+      geom_line(aes(x = Sim, y = Rank, color = Variable, group = Variable)) +
+      scale_y_continuous(trans = "reverse", breaks = unique(dat_rank$Rank)) +
+      labs(x = "Simulation",
+           y = "Rank (Higher Better)")
+  
+  print(p)
+    # ggplotly(p)
+}
+
+
+# FCR contour plot --------------------------------------------------------
+
+# Create fcr grid object
+fcr_grid_obj <- function(preds = "full", covars, outcome = "LRM_50"){
+  # Obtain name of lagged outcome variable
+  outcome_lag = get_lagged(outcome)
+  outcome_snippet = get_snippet(outcome)
+  
+  # Fit FCR given the covariates and outcome
+  form = formula_fcr(outcome = outcome, covariates = c(covars, outcome_lag),
+                     time_var = "inflight_time", K = 10)
+  
+  fit_fcr = do.call(fcr, list(formula = form, argvals = "inflight_time", 
+                              subj = "subj", data = as.data.frame(rst.smooth),
+                              argvals.new = time_grid,
+                              use_bam = TRUE, nPhi = 1))
+  saveRDS(fit_fcr, 
+          file.path(mod.path.final, 
+                    paste0("fcr_grid_", preds, "_", outcome_snippet, ".RDS")))
+}
+
+# Plot colors (code from https://github.com/tidyverse/ggplot2/issues/4088)
+# modified brewer_pal()
+craftbrewer_pal <- function (type = "seq", palette = 1, direction = 1) {
+  pal <- scales:::pal_name(palette, type)
+  force(direction)
+  function(n) {
+    n_max_palette <- RColorBrewer:::maxcolors[names(RColorBrewer:::maxcolors) == palette]
+    
+    if (n < 3) {
+      pal <- suppressWarnings(RColorBrewer::brewer.pal(n, pal))
+    } else if (n > n_max_palette){
+      rlang::warn(paste(n, "colours used, but", palette, "has only",
+                        n_max_palette, "- New palette created based on all colors of", 
+                        palette))
+      n_palette <- RColorBrewer::brewer.pal(n_max_palette, palette)
+      colfunc <- grDevices::colorRampPalette(n_palette)
+      pal <- colfunc(n)
+    }
+    else {
+      pal <- RColorBrewer::brewer.pal(n, pal)
+    }
+    pal <- pal[seq_len(n)]
+    if (direction == -1) {
+      pal <- rev(pal)
+    }
+    pal
+  }
+}
+
+# modified scale_fill_fermenter
+# (code from https://github.com/tidyverse/ggplot2/issues/4088)
+scale_fill_craftfermenter <- function(..., type = "seq", palette = 1, direction = -1, na.value = "grey50", guide = "coloursteps", aesthetics = "fill") {
+  type <- match.arg(type, c("seq", "div", "qual"))
+  if (type == "qual") {
+    warn("Using a discrete colour palette in a binned scale.\n  Consider using type = \"seq\" or type = \"div\" instead")
+  }
+  ggplot2:::binned_scale(aesthetics, "craftfermenter", ggplot2:::binned_pal(craftbrewer_pal(type, palette, direction)), na.value = na.value, guide = guide, ...)
+}
+
+# Given a fitted FCR model, plot the heatmaps of the predicted outcome
+# by time and a selected variable ("var1")
+# Inputs:
+# fcr_obj = fitted FCR grid object created by fcr_grid_obj()
+# dat0 = data used to fit fcr_obj
+# covs = covariates used to fit fcr_obj
+# var1 = name of variable to be plotted
+fcr_heatmap_1var <- function(dat0 = rst.smooth,
+                             fcr_obj, 
+                             outcome = "LRM_50",
+                             covars = covar_mod,
+                             var1 = "Radiation_Dose_CS"){
+  
+  # Ensure the outcome/covariates were in the fcr object
+  the_form = as.character(fcr_obj$fit$formula)
+  stopifnot(grepl(pattern = outcome, x = the_form[2]))
+  stopifnot(all(unlist(covars %>% map(grepl,x = the_form[3]))))
+  
+  # Obtain outcome label, lagged outcome name, var label
+  out_name = get_label(outcome)
+  outcome_lag = get_lagged(outcome)
+  var_name = get_label(var1)
+  
+  # Grid of all time/variable combinations
+  time_grid = seq(from = 0, to = 1, length.out = 50)
+  var_grid = seq(from = min(dat0[,var1]),
+                 to = max(dat0[,var1]),
+                 length.out = 50)
+  
+  # Create fake data
+  # All other covariates - obtain average value
+  other_covars = setdiff(covars, c(var1, "Subject_ID", "subj", "Male", "Test_Track_Type"))
+  
+  # dat_grid <- expand.grid(subj_grid, time_grid, var_grid) %>%
+  #   `colnames<-`(c("Subject_ID", "inflight_time", var1)) %>%
+  #   arrange(Subject_ID, inflight_time)
+  
+  dat_grid <- expand.grid(time_grid, var_grid) %>%
+    `colnames<-`(c("inflight_time", var1)) %>%
+    mutate(Subject_ID = 1001)
+  
+  # Get the average covariates
+  dat_fake0 <- dat0 %>%
+    dplyr::select(Subject_ID, subj, Male, Test_Track_Type, 
+                  all_of(c(other_covars, outcome_lag)))
+  
+  dat_fake <- dat_fake0 %>%
+    # First average over all participants/Male/Test Track Type
+    group_by(Subject_ID, subj, Male, Test_Track_Type) %>%
+    summarize_all(mean, na.rm = TRUE) %>%
+    ungroup %>%
+    # Then take average over all participants
+    dplyr::select(-Subject_ID, -subj) %>%
+    group_by(Male, Test_Track_Type) %>%
+    summarize_all(mean, na.rm = TRUE) %>%
+    mutate(Subject_ID = 1001,
+           subj = factor(Subject_ID)) %>%
+    inner_join(dat_grid, by = "Subject_ID") %>% ungroup %>%
+    filter(Male == TRUE,
+           Test_Track_Type == "Evening")
+  
+  # Predict outcome on the fake data
+  fcr_preds = predict(fcr_obj, newdata = dat_fake)$insample_predictions
+  
+  # Data for plots
+  plotvar2 = sym(var1)
+  dat_plot <- dat_fake %>%
+    dplyr::select(all_of(var1), inflight_time) %>%
+    mutate(Pred = fcr_preds) %>%
+    group_by(!!plotvar2, inflight_time) %>%
+    summarize(Pred = mean(Pred, na.rm = TRUE))
+  
+  
+  # Plot
+  
+  # Define breaks using deciles of the predicted outcome
+  mybreaks <- c(-Inf, quantile(dat_plot$Pred, prob = seq(0.1, 0.9, 0.1)), Inf)
+  names(mybreaks) <- NULL 
+  
+  p <- ggplot(dat_plot, aes_string(var1, "inflight_time", z = "Pred")) +
+    metR::geom_contour_fill() +
+    scale_fill_craftfermenter(
+      breaks = round(mybreaks,1), 
+      palette = "RdYlGn", 
+      guide = guide_colorsteps(
+        frame.colour = "black", 
+        ticks.colour = "black", # you can also remove the ticks with NA
+        barwidth=20)) +
+    theme(legend.position = "bottom",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    labs(y = "Inflight Time",
+         x = var_name,
+         fill = paste0("Predicted\n", out_name))
+  
+  print(p)
+}
+```
+
+
+
+# Appendix: Environmental Data Cleaning {.tabset}
+
+This script was run to process the environmental data in its raw format, in order to accommodate for spatial/temporal aggregation and integration with the RST data. For more details, see Section 2.4.
+
+```{r}
+# Set these to the location of the noise/temp/radiation/CO2 data
+noise.dir <- file.path(box_dir, "Acoustics Data/")
+temp.dir <- file.path(box_dir, "Temperature and ppO2 data/")
+rad.dir <- file.path(box_dir, "Radiation data/")
+co2.dir <- file.path(box_dir, "CO2 Data/")
+
+# For a data set dat that is grouped by Year, Month, Day, (Hour)
+# The name of the US Lab variable, and the Node 2 variable
+# And a stub for the output variables
+# Rename variables, tidy up, and add aggregate variable
+aggr_loc <- function(dat, lab_var, node_var){
+  # Make everything 
+  lab_var2 = enquo(lab_var)
+  node_var2 = enquo(node_var)
+  
+  # Weighted mean of the US Lab and Node 2 volumns
+  tmp = dat %>%
+    ungroup %>%
+    select(!!lab_var2, !!node_var2) 
+  
+  w_avg = tmp %>%
+    data.matrix %>% # Coerce to matrix
+    rowWeightedMeans(w = c(0.25, 0.75), na.rm = TRUE) %>%
+    replace_nan_with_na()
+  
+  new_colnames = c(colnames(dat %>% select(contains("Time"))),
+                   "Node 2", "US Lab", "Avg")
+  
+  dat %>%
+    ungroup %>%
+    select(contains("Time_"), !!node_var2, !!lab_var2) %>%
+    mutate(Avg = w_avg) %>%
+    `colnames<-`(new_colnames)
+}
+```
+
+## Temperature
+
+The Temperature and O2 data were combined in the same excel file.
+
+```{r}
+# temp_hr_loc.RDS
+# Read in all of the temperature files EXCEPT 2009 one (which is different)
+temp_files <- list.files(temp.dir, full.names = TRUE) %>%
+  # Remove files with ~$ in the filename
+  setdiff(., .[grepl("2009", .)]) %>%
+  setdiff(., .[grepl("copy", .)])
+
+# 2009 file
+fname_09 <- list.files(temp.dir, full.names = TRUE, 
+                       pattern = "2009 275 - 2010 077 Temp and O2 Combined converted.xlsx") 
+
+# Read the 2009 file in
+dat09 <- read_excel(fname_09,
+                    col_types = c("date", "numeric", "numeric",
+                                  "date", rep("numeric", 5))) %>%
+  slice(3:nrow(.)) %>% # Skip first couple lines as they are empty
+  select(-3) %>% # Get rid of the 3rd column as it's all missing
+  # Rename the LAER12FC0972P as Lab MCA
+  rename(LAER12FC0972P = `Lab MCA`,
+         # Rename the first column Time1 and the 3rd column Time2
+         Time1 = `...1`,
+         Time2 = `...4`) %>%
+  # Categorize temp sensors by location: US Lab, Node 2
+  select(Timestamp = Time1,
+         LAET23SR0201T, 
+         LAET27SR0201T, 
+         N2ET21SR0201T) %>%
+  gather(Sensor, Temp, -Timestamp) %>%
+  mutate(Location = recode(Sensor, 
+                           "LAET23SR0201T" = "US Lab",
+                           "LAET27SR0201T"= "US Lab",
+                           "N2ET21SR0201T" = "Node 2",
+                           .default = "Other")) %>%
+  group_by(Timestamp, Location) %>%
+  summarize(Temp = mean(Temp, na.rm = TRUE)) %>%
+  filter(!is.na(Temp))
+
+# Read and clean the data
+data_temp <- function(fname){
+  print(fname)
+  dat_ncol <- read_excel(fname, n_max = 3) %>% ncol()
+  dat <- read_excel(fname,
+                    col_types = c("date", rep("numeric", 
+                                              times = dat_ncol - 1))) %>%
+    slice(3:nrow(.)) %>%
+    rename(Timestamp = `...1`) %>%
+    # Categorize temp sensors by location: US Lab, Node 2, Other
+    select(Timestamp,
+           LAET23SR0201T, 
+           LAET27SR0201T, 
+           N2ET21SR0201T) %>%
+    gather(Sensor, Temp, -Timestamp) %>%
+    mutate(Location = recode(Sensor, 
+                             "LAET23SR0201T" = "US Lab",
+                             "LAET27SR0201T"= "US Lab",
+                             "N2ET21SR0201T" = "Node 2",
+                             .default = "Other")) %>%
+    group_by(Timestamp, Location) %>%
+    summarize(Temp = mean(Temp, na.rm = TRUE)) %>%
+    filter(!is.na(Temp))
+
+  return(dat)
+}
+
+out_temp = temp_files %>%
+  as.list() %>%
+  map(data_temp) %>%
+  reduce(full_join)
+
+# Glue the 2009 and post-2009 data together
+dat_temp <- rbind(dat09, out_temp) %>%
+  # Get the hourly information
+  mutate(Time0 = fastPOSIXct(Timestamp, tz = "UTC"),
+         Time_day = fastPOSIXct(trunc(Time0, units = "days"), tz = "UTC"),
+         Time_hour = fastPOSIXct(trunc(Time0, units = "hours"), tz = "UTC"))  
+
+# Aggregated by hour 
+dat_temp_hr <- dat_temp %>%
+  group_by(Time_hour, Location) %>%
+  summarize(Temp = mean(Temp, na.rm = TRUE)) %>%
+  spread(key = Location, value = Temp) %>%
+  aggr_loc(lab_var = `US Lab`,
+           node_var = `Node 2`) %>%
+  gather(Loc, Temp, -Time_hour) %>%
+  filter(!is.na(Temp))
+
+saveRDS(dat_temp_hr, file = paste0(out.dir, "temp_hr_loc.rds"))
+```
+
+## O2
+
+```{r}
+# ppo2_hr.rds
+# Read the 2009 file in
+dat09 <- read_excel(fname_09,
+                    col_types = c("date", "numeric", "numeric",
+                                  "date", rep("numeric", 5))) %>%
+  slice(3:nrow(.)) %>% # Skip first couple lines as they are empty
+  select(-3) %>% # Get rid of the 3rd column as it's all missing
+  # Rename the LAER12FC0972P as Lab MCA
+  rename(LAER12FC0972P = `Lab MCA`,
+         # Rename the first column Time1 and the 3rd column Time2
+         Time1 = `...1`,
+         Time2 = `...4`) %>%
+  # Categorize temp sensors by location: US Lab, Node 2, Other
+  select(Timestamp = Time2, 
+         LAER12FC0972P) %>%
+  gather(Sensor, ppO2, -Timestamp) %>%
+  # One row per raw timestamp and sensor
+  group_by(Timestamp, Sensor) %>%
+  summarize(ppO2 = mean(ppO2, na.rm = TRUE)) %>%
+  filter(!is.na(ppO2))
+
+# Read and clean data
+data_ppo2 <- function(fname){
+  print(fname)
+  dat <- read_excel(fname,
+                    col_types = c("date", rep("numeric", 7))) %>%
+    slice(3:nrow(.)) %>%
+    rename(Timestamp = `...1`) %>%
+    # Categorize temp sensors by location: US Lab, Node 2, Other
+    select(Timestamp, N3ER12FC0972P, LAER12FC0972P) %>%
+    gather(Sensor, ppO2, -Timestamp) %>%
+    group_by(Timestamp, Sensor) %>%
+    summarize(ppO2 = mean(ppO2, na.rm = TRUE)) %>%
+    filter(!is.na(ppO2))
+  
+  return(dat)
+}
+
+# Glue all post-2009 data together
+out_ppo2 = temp_files %>%
+  as.list() %>%
+  map(data_ppo2) %>%
+  reduce(full_join)
+
+# Glue the 2009 and post-2009 data together
+dat_ppo2 <- rbind(dat09, out_ppo2)
+
+# Hourly avereage by sensor
+ppo2_hr <- dat_ppo2 %>%
+  mutate(Time_hour = fastPOSIXct(trunc(Timestamp, units = "hours"), tz = "UTC")) 
+
+# Hourly average -- combined sensors
+ppo2_hr %>%
+  group_by(Time_hour, Sensor) %>%
+  summarize(ppO2 = mean(ppO2, na.rm = TRUE)) %>%
+  ungroup %>%
+  spread(Sensor, ppO2) %>%
+  mutate(ppO2 = ifelse(Time_hour >= as.Date("2001-02-17"), LAER12FC0972P, as.numeric(NA)),
+         ppO2 = ifelse(Time_hour >= as.Date("2010-09-08"), N3ER12FC0972P, ppO2),
+         ppO2 = ifelse(Time_hour >= as.Date("2011-05-13"), 
+                       rowMeans(select(., N3ER12FC0972P , LAER12FC0972P), na.rm = TRUE), ppO2),
+         ppO2 = ifelse(Time_hour >= as.Date("2012-01-29"), N3ER12FC0972P, ppO2),
+         ppO2 = delete_reps(ppO2)) %>%
+  filter(!is.na(ppO2)) %>%
+  select(Time_hour, ppO2) %>%
+  saveRDS(., file = paste0(out.dir, "ppo2_hr.rds"))
+```
+
+
+## CO2
+
+```{r}
+# co2_hourly.RDS
+co2_files = list.files(co2.dir, pattern = "xlsx", full.names = TRUE)
+
+# Reads in the file in fname and only keeps the columns starting
+# at index_start up to a length of index_width
+data_co2_pieces <- function(dat, index_start, index_len = 5,  ...){
+  
+  
+  indices = seq(from = index_start, len = index_len)
+  
+  dat2 <- dat %>%
+    select(indices)
+  
+  cnames_temp <- colnames(dat2)[4:index_len] %>%
+    substr(start = 1, stop = 2) %>%
+    recode("No" = "Node3", "Ye" = "Year", "La" = "Lab", "N3" = "Node3")
+  
+  cnames_out <- c("Date", "Col1", "Col2", cnames_temp)
+  
+  dat2 %>%
+    `colnames<-`(cnames_out) %>%
+    # Carry year forward
+    mutate(Year = zoo::na.locf(Year)) %>%
+    mutate_at(vars(-Date), as.numeric)
+}
+
+# For each sheet, try to get all the data and stack it on each other
+data_co2 <- function(fname){
+  dat <- read_excel(fname, sheet = 1)
+  
+  # Look for the columns that have "Date" in it
+  # Store these column indices in date_indices
+  cnames <- colnames(dat)
+  date_indices <- grep(x = cnames, pattern = "Date")
+  
+  # Figure out what all of the other columns are
+  index_len = date_indices[2] - date_indices[1]
+  
+  # For each date column, only grab the next 3 columns
+  dat3 <- date_indices %>%
+    map(~data_co2_pieces(dat, index_start = ., index_len)) %>%
+    bind_rows %>%
+    gather(Sensor, CO2, -Date, -Year) %>%
+    filter(!is.na(CO2)) %>%
+    # Date format
+    mutate(d_days = substr(Date, start = 1, stop = 3),
+           d_hour = substr(Date, start = 5, stop = 6),
+           d_minu = substr(Date, start = 8, stop = 9),
+           d_seco = substr(Date, start = 11, stop = 16)) %>%
+    mutate_at(vars(d_days, d_hour, d_minu, d_seco), as.numeric) %>%
+    # Ignore missing values of date - average columns
+    filter(!is.na(d_days)) %>%
+    # Calculate the date is Date2
+    mutate(Date2 = fastPOSIXct(paste0(Year, "-01-01 00:00:00"), tz = "GMT") + 
+             days(d_days - 1) +  # Don't count first day
+             hours(d_hour) + minutes(d_minu) + seconds(d_seco))
+  
+  # Detect and get rid of incomplete days.
+  dat3_incomplete <- dat3 %>%
+    group_by(Year, d_days) %>% 
+    summarize(n1 = min(d_hour), n2 = min(d_minu),
+              n3 = max(d_hour), n4 = max(d_minu)) %>%
+    # Get days that started in the middle of the day, or
+    # ended before the day was over
+    filter(!(n1 == 0 & n2 == 0 & n3 == 23 & n4 == 59)) %>%
+    select(Year, d_days)
+  
+  # Aggregate at the day level now
+  out <- dat3 %>%
+    # Remove the rows that had incomplete days
+    anti_join(dat3_incomplete, by = c("Year", "d_days")) %>%
+    select(Date = Date2, Sensor, CO2) %>% 
+    distinct()
+    
+  return(out)
+}
+
+# Do the same thing as datCO2 but for the first file 
+data_co2a <- function(fname){
+  dat <- read_excel(fname, sheet = 1)
+  
+  # Get the Date columns
+  cnames <- colnames(dat)
+  date_indices <- grep(x = cnames, pattern = "Date")
+  
+  index_len = date_indices[2] - date_indices[1]
+  
+  # For each date column, only grab the next 3 columns
+  dat3 <- date_indices %>%
+    map(~data_co2_pieces(dat, index_start = ., index_len)) %>%
+    bind_rows %>%
+    gather(Sensor, CO2, -Date, -Year) %>%
+    filter(!is.na(CO2)) %>%
+    select(Date, Year, Sensor, CO2) %>%
+    mutate(Time_year = year(Date),
+           Time_month = month(Date),
+           Time_day = day(Date),
+           Time_hour = hour(Date))
+  
+  # Get rid of incomplete days.
+  dat3_incomplete <- dat3 %>%
+    mutate(Hour = hour(Date),
+           Minute = minute(Date),
+           Second = second(Date)) %>%
+    group_by(Time_day, Time_month, Time_year) %>% 
+    mutate(n1 = min(Hour), n2 = min(Minute),
+              n3 = max(Hour), n4 = max(Minute)) %>%
+    ungroup %>%
+    filter(!(n1 == 0 & n2 == 0 & n3 == 23 & n4 == 59)) %>%
+    arrange(Time_year, Time_month, Time_day) %>%
+    slice(c(1, nrow(.))) %>%
+    select(Time_year, Time_month, Time_day)
+  
+  # Aggregate at the day level now
+  out <- dat3 %>%
+    anti_join(dat3_incomplete, by = c("Time_year", "Time_month", "Time_day")) %>%
+    select(Date, Sensor, CO2) %>%
+    distinct()
+  
+  return(out)
+}
+
+# First file 
+dat_co2a <- co2_files[1] %>%
+  as.list() %>%
+  map(data_co2a) %>%
+  bind_rows
+
+# All the other files are formatted similarly
+dat_co2b <- co2_files[2:18] %>%
+  as.list() %>%
+  map(data_co2) %>%
+  bind_rows
+
+dat_co2_all <- bind_rows(dat_co2a, dat_co2b) %>%
+  distinct %>%
+  filter(!is.na(Date)) %>%
+  mutate(Time_day = fastPOSIXct(trunc(Date, units = "days"), tz = "UTC"),
+         Time_hour = fastPOSIXct(trunc(Date, units = "hours"), tz = "UTC"))
+
+saveRDS(dat_co2_all, file.path(dir.path, "co2_raw.RDS"))
+
+readRDS(file.path(dir.path, "co2_raw.RDS")) %>%
+  select(Date, Sensor, CO2, Time_hour) %>%
+  distinct %>%
+  # Take hourly average
+  group_by(Sensor, Time_hour) %>%
+  summarize(CO2 = mean(CO2, na.rm = TRUE)) %>%
+  spread(Sensor, CO2) %>%
+  # Combine Col1 and Col2
+  mutate(Col = rowMeans(select(., Col1, Col2), na.rm = TRUE)) %>%
+  # Indicator for best CO2 measurement
+  mutate(CO2 = ifelse(Time_hour >= as.Date("2001-02-17"), Lab, as.numeric(NA)),
+         CO2 = ifelse(Time_hour >= as.Date("2010-09-08"), Node3, CO2),
+         CO2 = ifelse(Time_hour >= as.Date("2011-05-13"), Col, CO2),
+         CO2 = ifelse(Time_hour >= as.Date("2012-01-29"), Node3, CO2)) %>%
+  # Sort by ascending time
+  select(Time_hour, CO2) %>%
+  arrange(Time_hour) %>%
+  saveRDS(., file.path(dir.path, "co2_hourly.RDS"))
+```
+
+
+## Radiation
+
+```{r}
+# Radiation
+# Read in all the noise files in the rad.dir folder
+rad_files = list.files(rad.dir, pattern = "xlsx", full.names = TRUE)
+rad_files = setdiff(x = rad_files,
+                    y = rad_files[grepl(pattern = "[(]1", rad_files)]) %>%
+  setdiff(x = .,
+          y = rad_files[grepl(pattern = "2009-2012 TLD100 RAM data_2", x = rad_files)])
+
+# Read in the data
+# Formats it properly and calculates the total Radiation Dose as
+# Radiation_Dose = GCRDose + SAADose
+data_rad <- function(fname){
+  dat <- read_excel(fname,
+                    col_types = c("date", "text", "text", "numeric", "numeric")) %>%
+    select(Date, Instrument, Location,
+           Radiation_GCRDose = `GCRDose (mGy/d)`,
+           Radiation_SAADose = `SAADose (mGy/d)`) %>%
+    # Add GCRDose and SAA Dose
+    mutate(Radiation_Dose = Radiation_GCRDose + Radiation_SAADose)
+  
+  return(dat)
+}
+
+out_rad = as.list(rad_files) %>%
+  map(data_rad) %>%
+  reduce(full_join) %>%
+  distinct()
+
+out_rad %>% 
+  mutate()
+  saveRDS(file.path(out.dir, "rad_raw.rds"))
+
+# Aggregate radiation at the date/location level
+rad_day = out_rad %>%
+  mutate(Time_day = as.POSIXct(trunc(Date, units = "days"))) %>%
+  group_by(Time_day) %>%
+  # There are multiple instruments/locations, just take the average of these every day
+  summarize(Radiation_Dose = mean(Radiation_Dose, na.rm = TRUE))
+
+rad_day %>%
+  saveRDS(., file = paste0(dir.path, "rad_day.rds"))
+```
+
+## Noise 
+
+```{r}
+# noise_hr_noloc.rds
+# Read in all the noise files 
+noise_files = list.files(noise.dir, pattern = "xlsx", full.names = TRUE)
+noise_files = noise_files[!grepl("Noise data.xlsx", noise_files)]
+
+# This function reads in the file at fname
+data_noise <- function(fname){
+  
+  # Extract the sensor location from the filename:
+  # it's the thing that comes after the date
+  location = basename(fname) %>%
+    str_split(., "Static ") %>%
+    `[[`(1) %>% `[`(2) %>% 
+    str_split(., " Raw") %>% 
+    `[[`(1) %>% `[`(1)
+  
+  # Deal with other cases
+  if (is.na(location)){
+    location <- if (grepl(pattern = "NODE 2", fname)){"Node 2"} else {location}
+    location <- if (grepl(pattern = "JPM", fname)){"JPM"} else {location}
+  }
+  
+  location2 <- if (grepl(pattern = "Node 2", location)) {
+    "Node 2"
+  } else {
+    if (grepl(pattern = "US Lab", location)){
+      "US Lab"
+    } else {
+      "Other"
+    }
+  }
+  
+  
+  # Read in the data within the file
+  dat <- read_excel(fname,
+                    col_types = c("date", "numeric"))
+  
+  dat2 <- dat %>%
+    # Rename the column names
+    `colnames<-`(c("Timestamp", "dBA")) %>%
+    # Skip the empty rows
+    filter(!is.na(Timestamp)) %>%
+    # Add column for location of the sensor
+    mutate(Orig_Sensor = location,
+           Loc = location2,
+           # For noise interpolation
+           # Morning = 7am until 11pm (16 hours)
+           # Evening = 11pm - 7am (8 hours)
+           Noise_Day = ((hour(Timestamp) >= 7) & (hour(Timestamp) < 23)))
+  
+  return(dat2)
+}
+
+# Apply the data_noise() function to everything in noise_files
+# And glue it all together
+out_noise = as.list(noise_files) %>%
+  purrr::map(data_noise) %>%
+  reduce(full_join)
+
+# Aggregate noise at the hour level - no location
+out_noise %>%
+  mutate(Timestamp = as.POSIXct(Timestamp, tz = "UTC"),
+         Time_hour = as.POSIXct(trunc(Timestamp, units = "hours")),
+         # Decibels aren't linear so you can't just take the average
+         # of decibels, you need to take the average of energy
+         # Energy = 10^(decibels/10)
+         Energy = 10^(dBA/10)) %>%
+  group_by(Time_hour, Noise_Day) %>%
+  summarize(Energy_Mean = mean(Energy, na.rm = TRUE)) %>%
+  ungroup %>%
+  mutate(Noise_dBA = 10*log(Energy_Mean, base = 10))  %>%
+  saveRDS(., file = paste0(dir.path, "noise_hr_noloc.rds"))
+```
+
+
+# References
