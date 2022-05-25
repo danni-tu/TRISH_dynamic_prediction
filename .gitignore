@@ -43,3 +43,4 @@ vignettes/*.pdf
 
 # This file
 .gitignore
+.DS_Store
