@@ -649,3 +649,320 @@ fcr_heatmap_2var <- function(dat0 = rst.smooth,
   
   print(p)
 }
+
+smooth_env_plot <- function(rst.full, var = "Noise_dBA", smooth.dir = smooth.path){
+  
+  # For noise, plot Day/Night Separately
+  if (var == "Noise_dBA"){
+    cnames = c("Time_hour", "Noise_Day", var, paste0(var, "_CS"))
+    var_smoothed = smooth_fun(dat0 = rst.full, var = "Noise_dBA", 
+                              day_level = FALSE, smooth.dir = smooth.path,
+                              return_loess = TRUE)
+    
+    var_smoothed_dat <- var_smoothed$smooth_dat %>%
+      filter(Time_Type == "Flight") %>%
+      dplyr::select(all_of(cnames)) %>%
+      `colnames<-`(c("Time", "Noise_Day", "Original", "Interpolated"))
+    
+    # Points: the observed data 
+    fig1_obs = var_smoothed_dat %>%
+      filter(!is.na(Original)) %>%
+      select(Time, Noise_Day, Value = Original) %>%
+      mutate(Type = "Original")
+    
+    # Crosses: the interpolated data
+    fig1_int =  var_smoothed_dat %>%
+      filter(is.na(Original)) %>%
+      select(Time, Noise_Day, Value = Interpolated) %>%
+      mutate(Type = "Interpolated")
+    
+    # Line: the LOESS fit
+    day_ind = which(var_smoothed_dat$Noise_Day)
+    plot_dates_day = sort(c(fig1_obs$Time[day_ind], fig1_int$Time[day_ind]))
+    plot_dates_night = sort(c(fig1_obs$Time[-day_ind], fig1_int$Time[-day_ind]))
+    
+    fig1_loess_day = data.frame(Time = plot_dates_day,
+                                Noise_Day = TRUE,
+                                Value = var_smoothed$smooth_obj$Day(plot_dates_day),
+                                Type = "Smooth Fit")
+    
+    fig1_loess_night = data.frame(Time = plot_dates_night,
+                                  Noise_Day = FALSE,
+                                  Value = var_smoothed$smooth_obj$Night(plot_dates_night),
+                                  Type = "Smooth Fit")
+    
+    fig1_dat <- rbind(fig1_obs, fig1_int, fig1_loess_day, fig1_loess_night)
+    
+    
+    # Plot
+    var_label = get_label(var)
+    
+    # Get limits
+    y1 = min(fig1_dat$Value, na.rm = TRUE)
+    y2 = max(fig1_dat$Value, na.rm = TRUE)
+    
+    # Day Plot
+    p1 = ggplot(fig1_dat) +
+      # # Points: the observed data 
+      # geom_point(data = fig1_dat %>% filter(Type == "Original", Noise_Day),
+      #            aes(x = Time, y = Value, color = Type),
+      #            size = 1.5, shape = 1) +
+      # Crosses: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated", Noise_Day),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 3, shape = 18) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit", Noise_Day),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = paste0(var_label, ": Daytime"),
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "none", text = element_text(size = 12))
+    
+    # Night Plot
+    p2 = ggplot(fig1_dat) +
+      # Points: the observed data 
+      geom_point(data = fig1_dat %>% filter(Type == "Original", !Noise_Day),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 1.5, shape = 1) +
+      # Crosses: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated", !Noise_Day),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 3, shape = 18) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit", !Noise_Day),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = paste0(var_label, ": Nighttime"),
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "bottom", text = element_text(size = 12))
+    
+    return(list(p1, p2))
+    
+  } 
+  
+  # For temp, plot Avg/Node 2/US Lab separately
+  if (var == "Temp"){
+    cnames = c("Time_hour", "Location", var, paste0(var, "_CS"))
+    var_smoothed = smooth_fun(dat0 = rst.full, var = var, 
+                              day_level = FALSE, smooth.dir = smooth.path,
+                              return_loess = TRUE)
+    
+    var_smoothed_dat <- var_smoothed$smooth_dat %>%
+      filter(Time_Type == "Flight") %>%
+      select(all_of(cnames)) %>%
+      `colnames<-`(c("Time", "Location", "Original", "Interpolated"))
+    
+    # Points: the observed data 
+    fig1_obs = var_smoothed_dat %>%
+      filter(!is.na(Original)) %>%
+      select(Time, Location, Value = Original) %>%
+      mutate(Type = "Original")
+    
+    # Crosses: the interpolated data
+    fig1_int =  var_smoothed_dat %>%
+      filter(is.na(Original)) %>%
+      select(Time, Location, Value = Interpolated) %>%
+      mutate(Type = "Interpolated")
+    
+    # Line: the LOESS fit
+    ind_avg = which(var_smoothed_dat$Location == "Avg")
+    ind_no2 = which(var_smoothed_dat$Location == "Node 2")
+    ind_lab = which(var_smoothed_dat$Location == "US Lab")
+    
+    plot_dates_avg = sort(c(fig1_obs$Time[ind_avg], fig1_int$Time[ind_avg]))
+    plot_dates_no2 = sort(c(fig1_obs$Time[ind_no2], fig1_int$Time[ind_no2]))
+    plot_dates_lab = sort(c(fig1_obs$Time[ind_lab], fig1_int$Time[ind_lab]))
+    
+    fig1_loess_avg = data.frame(Time = plot_dates_avg,
+                                Location = "Avg",
+                                Value = predict(var_smoothed$smooth_obj$avg, plot_dates_avg),
+                                Type = "Smooth Fit")
+    
+    fig1_loess_no2 = data.frame(Time = plot_dates_no2,
+                                Location = "Node 2",
+                                Value = predict(var_smoothed$smooth_obj$no2, plot_dates_no2),
+                                Type = "Smooth Fit")
+    
+    fig1_loess_lab = data.frame(Time = plot_dates_lab,
+                                Location = "US Lab",
+                                Value = predict(var_smoothed$smooth_obj$lab, plot_dates_lab),
+                                Type = "Smooth Fit")
+    
+    fig1_dat <- rbind(fig1_obs, fig1_int, fig1_loess_avg, fig1_loess_no2, fig1_loess_lab)
+    
+    
+    # Plot
+    var_label = get_label(var)
+    
+    # Get limits
+    y1 = min(fig1_dat$Value, na.rm = TRUE)
+    y2 = max(fig1_dat$Value, na.rm = TRUE)
+    
+    # Avg Plot
+    p1 = ggplot(fig1_dat) +
+      # Points: the observed data 
+      geom_point(data = fig1_dat %>% filter(Type == "Original", Location == "Avg"),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 1.5, shape = 1) +
+      # Crosses: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated", Location == "Avg"),
+                 aes(x = Time, y = Value, color = Type),
+                 size =3, shape = 18) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit", Location == "Avg"),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = paste0(var_label, ": Average"),
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "none", text = element_text(size = 12))
+    
+    # Node 2 Plot
+    p2 = ggplot(fig1_dat) +
+      # Points: the observed data 
+      geom_point(data = fig1_dat %>% filter(Type == "Original", Location == "Node 2"),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 1.5, shape = 1) +
+      # Crosses: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated", Location == "Node 2"),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 3, shape = 18) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit", Location == "Node 2"),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = paste0(var_label, ": Node 2"),
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "none", text = element_text(size = 12))
+    
+    # US Lab Plot
+    p3 = ggplot(fig1_dat) +
+      # Points: the observed data 
+      geom_point(data = fig1_dat %>% filter(Type == "Original", Location == "US Lab"),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 1.5, shape = 1) +
+      # Crosses: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated", Location == "US Lab"),
+                 aes(x = Time, y = Value, color = Type),
+                 size = 3, shape = 18) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit", Location == "US Lab"),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = paste0(var_label, ": US Lab"),
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "bottom", text = element_text(size = 12))
+    
+    return(list(p1, p2, p3))
+  }
+  
+  # Lapses was carried forward
+  if (var == "Pred_Lapses"){
+    
+    
+    p1 = ggplot(fig1_dat) +
+      # Points: the observed data 
+      geom_point(data = fig1_dat %>% filter(Type == "Original"),
+                 aes(x = Time, y = Value, color = Type), shape = 1,
+                 size = 1.5) +
+      # Diamonds: the interpolated data
+      geom_point(data = fig1_dat %>% filter(Type == "Interpolated"),
+                 aes(x = Time, y = Value, color = Type), shape = 18, 
+                 size = 3) +
+      # Line: the LOESS fit
+      geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit"),
+                aes(x = Time, y = Value, linetype = Type),
+                size = 0.75, alpha = 0.5) +
+      scale_color_manual(breaks = c("Original", "Interpolated"),
+                         values = c("#A1C1F9", "#20773C")) +
+      labs(title = "", y = var_label,
+           x = "Time") +
+      ylim(y1, y2) +
+      theme_minimal() +
+      theme(legend.position = "none", text = element_text(size = 12))
+  }
+  
+  # For Radiation/CO2/O2
+  cnames = c("Time_hour", var, paste0(var, "_CS"))
+  var_smoothed = smooth_fun(dat0 = rst.full, var = var, 
+                            day_level = FALSE, smooth.dir = smooth.path,
+                            return_loess = TRUE)
+  
+  var_smoothed_dat <- var_smoothed$smooth_dat %>%
+    filter(Time_Type == "Flight") %>%
+    select(all_of(cnames)) %>%
+    `colnames<-`(c("Time", "Original", "Interpolated"))
+  
+  # Points: the observed data 
+  fig1_obs = var_smoothed_dat %>%
+    filter(!is.na(Original)) %>%
+    select(Time, Value = Original) %>%
+    mutate(Type = "Original")
+  
+  # Crosses: the interpolated data
+  fig1_int =  var_smoothed_dat %>%
+    filter(is.na(Original)) %>%
+    select(Time, Value = Interpolated) %>%
+    mutate(Type = "Interpolated")
+  
+  # Line: the LOESS fit
+  plot_dates = sort(c(fig1_obs$Time, fig1_int$Time))
+  fig1_loess = data.frame(Time = plot_dates,
+                          Value = predict(var_smoothed$smooth_obj,plot_dates),
+                          Type = "Smooth Fit")
+  
+  fig1_dat <- rbind(fig1_obs, fig1_int, fig1_loess)
+  
+  # Plot
+  var_label = get_label(var)
+  
+  # Get limits
+  y1 = min(fig1_dat$Value, na.rm = TRUE)
+  y2 = max(fig1_dat$Value, na.rm = TRUE)
+  
+  p1 = ggplot(fig1_dat) +
+    # Points: the observed data 
+    geom_point(data = fig1_dat %>% filter(Type == "Original"),
+               aes(x = Time, y = Value, color = Type), shape = 1,
+               size = 1.5) +
+    # Diamonds: the interpolated data
+    geom_point(data = fig1_dat %>% filter(Type == "Interpolated"),
+               aes(x = Time, y = Value, color = Type), shape = 18, 
+               size = 3) +
+    # Line: the LOESS fit
+    geom_line(data = fig1_dat %>% filter(Type == "Smooth Fit"),
+              aes(x = Time, y = Value, linetype = Type),
+              size = 0.75, alpha = 0.5) +
+    scale_color_manual(breaks = c("Original", "Interpolated"),
+                       values = c("#A1C1F9", "#20773C")) +
+    labs(title = "", y = var_label,
+         x = "Time") +
+    ylim(y1, y2) +
+    theme_minimal() +
+    theme(legend.position = "bottom", text = element_text(size = 12))
+  # For levend
+  # theme(legend.position = "bottom", text = element_text(size = 12))
+  
+  return(p1)
+  
+}
